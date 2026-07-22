@@ -1,6 +1,67 @@
-# Architecture Overview & Security Notes
+# Project Management App
 
-Stack: Next.js 14 App Router (API + frontend), Drizzle ORM over PostgreSQL with Row-Level Security, NextAuth v5 (JWT sessions), Socket.io for realtime. Files referenced below live in this same directory tree.
+Stack: Next.js 14 App Router (API + frontend), Drizzle ORM over PostgreSQL with Row-Level Security, NextAuth v5 (JWT sessions), Socket.io for realtime.
+
+## Getting started
+
+Requirements: Node 20+, Docker (for local Postgres) or your own Postgres 16 instance.
+
+1. Install dependencies:
+
+   ```bash
+   npm install
+   ```
+
+2. Start Postgres (or point `DATABASE_URL` at an existing instance):
+
+   ```bash
+   docker compose up -d
+   ```
+
+3. Copy the env file and fill in real values:
+
+   ```bash
+   cp .env.example .env
+   ```
+
+   Generate `AUTH_SECRET` with `npx auth secret`, or any random 32-byte value.
+
+4. Push the schema to the database (creates tables + enums; RLS policies are separate — see below):
+
+   ```bash
+   npm run db:push
+   ```
+
+5. Apply Row-Level Security. `db:push` only creates tables from `db/schema.ts` — the policies, helper functions, and the one-personal-workspace-per-owner constraint live in raw SQL and must be run once, after the tables exist:
+
+   ```bash
+   psql "$DATABASE_URL" -f db/rls-policies.sql
+   ```
+
+6. Start the app:
+
+   ```bash
+   npm run dev
+   ```
+
+   Visit `http://localhost:3000` — you'll land on `/login`, where you can create an account (this auto-provisions your personal workspace).
+
+7. (Optional, for live Kanban updates across browser tabs/users) start the realtime server in a second terminal:
+
+   ```bash
+   npm run socket
+   ```
+
+### Other useful scripts
+
+- `npm run typecheck` — `tsc --noEmit` across the whole project.
+- `npm run db:studio` — Drizzle Studio, a GUI for browsing the database.
+- `npm run db:generate` — generate a versioned SQL migration from schema changes instead of `db:push` (recommended once you have real data you don't want to risk with a diff-and-apply push).
+
+### Notes on what's stubbed
+
+- `services/notifications.ts` logs to the console instead of actually sending email — swap in a real provider (Resend, SES, Postmark) before this goes further than local use.
+- There's no seed script yet; the fastest way to get a second test user is to sign up a second account in an incognito window and invite it to a project from the first account's UI (once you wire a project page up to `components/KanbanBoard.tsx` and `ProjectCollaboratorModal.tsx` — the dashboard shell at `app/page.tsx` is currently a minimal placeholder that only renders the workspace switcher).
 
 ## File map
 

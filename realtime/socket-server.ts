@@ -19,8 +19,20 @@ const io = new Server(httpServer, {
 io.use(async (socket, next) => {
   try {
     const cookies = parse(socket.handshake.headers.cookie ?? "");
-    const sessionToken = cookies["authjs.session-token"] ?? cookies["__Secure-authjs.session-token"];
-    const token = await decode({ token: sessionToken, secret: process.env.AUTH_SECRET! });
+    const secureCookieName = "__Secure-authjs.session-token";
+    const plainCookieName = "authjs.session-token";
+    const cookieName = cookies[secureCookieName] ? secureCookieName : plainCookieName;
+    const sessionToken = cookies[cookieName];
+    if (!sessionToken) return next(new Error("unauthenticated"));
+
+    // Auth.js v5 derives the decryption key from (secret, salt), where salt
+    // must be the exact cookie name the token was issued under — passing
+    // the wrong one (or omitting it) fails decoding even with the right secret.
+    const token = await decode({
+      token: sessionToken,
+      secret: process.env.AUTH_SECRET!,
+      salt: cookieName,
+    });
     if (!token?.userId) return next(new Error("unauthenticated"));
 
     const projectId = socket.handshake.query.projectId as string;
