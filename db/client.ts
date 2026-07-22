@@ -1,8 +1,16 @@
 import { drizzle, NodePgDatabase } from "drizzle-orm/node-postgres";
 import { sql } from "drizzle-orm";
-import { Pool } from "pg";
+import pg from "pg";
 import { AsyncLocalStorage } from "node:async_hooks";
 import * as schema from "./schema";
+
+// `pg` is CommonJS and assigns `Pool` onto module.exports dynamically
+// (`module.exports.Pool = Pool`, not a static property), so Node's ESM
+// loader can't see it as a named export and `import { Pool } from "pg"`
+// fails at runtime with "does not provide an export named 'Pool'" — even
+// though it typechecks fine, since @types/pg declares it as a named
+// export. Importing the default and destructuring is the standard fix.
+const { Pool } = pg;
 
 // The pool connects as an application role that owns no BYPASSRLS privilege.
 // RLS policies use FORCE ROW LEVEL SECURITY, so even the table owner role

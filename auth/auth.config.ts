@@ -10,7 +10,10 @@
 
 import type { NextAuthConfig } from "next-auth";
 import Credentials from "next-auth/providers/credentials";
-import { compare } from "bcryptjs";
+// See auth/signup.ts for why this can't be a named import — bcryptjs's
+// CJS bundle isn't statically analyzable for ESM named-export synthesis.
+import bcryptjs from "bcryptjs";
+const { compare } = bcryptjs;
 import { db } from "../db/client";
 
 export const authConfig: NextAuthConfig = {

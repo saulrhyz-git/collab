@@ -11,7 +11,12 @@
  * policies at all — email lookup has to work before any session exists.
  */
 
-import { hash } from "bcryptjs";
+// bcryptjs's CJS bundle doesn't expose statically-analyzable named exports
+// (module.exports = require("./dist/bcrypt.js"), a dynamic re-export), so
+// `import { hash } from "bcryptjs"` fails at runtime under Node ESM the
+// same way `pg`'s `Pool` does — see db/client.ts for the longer version.
+import bcryptjs from "bcryptjs";
+const { hash } = bcryptjs;
 import { db } from "../db/client";
 import { users, workspaces, workspaceMembers } from "../db/schema";
 import { sql } from "drizzle-orm";
