@@ -1,6 +1,7 @@
 import { eq, and } from "drizzle-orm";
 import { db } from "../db/client";
 import { tasks, projects, projectMembers, workspaceMembers, users, activityLogs } from "../db/schema";
+import { isSuperAdmin } from "../auth/super-admin";
 
 export class NotAuthorizedError extends Error {}
 export class NotFoundError extends Error {}
@@ -19,6 +20,9 @@ async function requireProjectAccess(projectId: string, workspaceId: string, user
     where: and(eq(projectMembers.projectId, projectId), eq(projectMembers.userId, userId)),
   });
   if (projectMembership) return projectMembership.role;
+
+  // Full read/write access to every project, membership row or not.
+  if (await isSuperAdmin(userId)) return "PROJECT_ADMIN" as const;
 
   const project = await db.query.projects.findFirst({ where: eq(projects.id, projectId) });
   if (project?.visibility === "PUBLIC_TO_WORKSPACE") {

@@ -16,7 +16,8 @@
 
 import { NextRequest, NextResponse } from "next/server";
 import { auth } from "./index";
-import { db } from "../db/client";
+import { db, runWithRlsContext } from "../db/client";
+import { isSuperAdmin } from "./super-admin";
 
 export const ACTIVE_WORKSPACE_COOKIE = "active_workspace_id";
 
@@ -42,35 +43,52 @@ export async function resolveRequestContext(req: NextRequest): Promise<RequestCo
   const claimedWorkspaceId =
     req.cookies.get(ACTIVE_WORKSPACE_COOKIE)?.value ?? req.headers.get("x-workspace-id");
 
-  if (!claimedWorkspaceId) {
-    // No workspace selected yet — fall back to the user's personal workspace.
-    const personal = await db.query.workspaces.findFirst({
-      where: (w, { eq, and }) => and(eq(w.ownerId, userId), eq(w.type, "PERSONAL")),
+  // Self-contained RLS context: this function does its own DB reads, so it
+  // establishes the session context itself rather than assuming a caller
+  // already did — see db/client.ts. Without this, `workspace_members` (which
+  // has FORCE ROW LEVEL SECURITY) would return zero rows for everyone,
+  // including legitimate members, because Postgres wouldn't know who's asking.
+  return runWithRlsContext({ userId }, async () => {
+    if (!claimedWorkspaceId) {
+      // No workspace selected yet — fall back to the user's personal workspace.
+      const personal = await db.query.workspaces.findFirst({
+        where: (w, { eq, and }) => and(eq(w.ownerId, userId), eq(w.type, "PERSONAL")),
+      });
+      if (!personal) throw new NoWorkspaceAccessError("No personal workspace found.");
+      return { userId, activeWorkspaceId: personal.id, role: "OWNER" as const };
+    }
+
+    // Authoritative check: does this user actually have a membership row for
+    // the claimed workspace? A forged cookie with someone else's workspace id
+    // fails here regardless of anything the client asserts.
+    const membership = await db.query.workspaceMembers.findFirst({
+      where: (wm, { eq, and }) =>
+        and(eq(wm.workspaceId, claimedWorkspaceId), eq(wm.userId, userId)),
     });
-    if (!personal) throw new NoWorkspaceAccessError("No personal workspace found.");
-    return { userId, activeWorkspaceId: personal.id, role: "OWNER" };
-  }
 
-  // Authoritative check: does this user actually have a membership row for
-  // the claimed workspace? A forged cookie with someone else's workspace id
-  // fails here regardless of anything the client asserts.
-  const membership = await db.query.workspaceMembers.findFirst({
-    where: (wm, { eq, and }) =>
-      and(eq(wm.workspaceId, claimedWorkspaceId), eq(wm.userId, userId)),
+    if (!membership) {
+      // A super admin can select any workspace as "active" without a
+      // membership row — RLS independently allows this via its own
+      // is_super_admin() check (db/rls-policies.sql), this is just the
+      // app-layer mirror of that so the UI/role reported here is accurate.
+      if (await isSuperAdmin(userId)) {
+        return { userId, activeWorkspaceId: claimedWorkspaceId, role: "ADMIN" as const };
+      }
+      throw new NoWorkspaceAccessError(
+        `User ${userId} is not a member of workspace ${claimedWorkspaceId}.`
+      );
+    }
+
+    return { userId, activeWorkspaceId: claimedWorkspaceId, role: membership.role };
   });
-
-  if (!membership) {
-    throw new NoWorkspaceAccessError(
-      `User ${userId} is not a member of workspace ${claimedWorkspaceId}.`
-    );
-  }
-
-  return { userId, activeWorkspaceId: claimedWorkspaceId, role: membership.role };
 }
 
 /**
- * Convenience wrapper for route handlers: resolves context, maps known
- * errors to HTTP responses, and otherwise hands the context to `fn`.
+ * Convenience wrapper for route handlers: resolves context, re-establishes
+ * the RLS session for the actual handler body (resolveRequestContext's own
+ * internal runWithRlsContext call only covers its own reads — `fn` itself
+ * will make further `db.*` calls via services that need context too), maps
+ * known errors to HTTP responses, and otherwise hands the context to `fn`.
  */
 export function withWorkspaceContext(
   fn: (req: NextRequest, ctx: RequestContext) => Promise<NextResponse>
@@ -78,7 +96,10 @@ export function withWorkspaceContext(
   return async (req: NextRequest) => {
     try {
       const ctx = await resolveRequestContext(req);
-      return await fn(req, ctx);
+      return await runWithRlsContext(
+        { userId: ctx.userId, workspaceId: ctx.activeWorkspaceId },
+        () => fn(req, ctx)
+      );
     } catch (err) {
       if (err instanceof UnauthenticatedError) {
         return NextResponse.json({ error: "Unauthenticated" }, { status: 401 });
@@ -100,16 +121,20 @@ export async function switchActiveWorkspace(
   userId: string,
   targetWorkspaceId: string
 ): Promise<NextResponse> {
-  const membership = await db.query.workspaceMembers.findFirst({
-    where: (wm, { eq, and }) =>
-      and(eq(wm.workspaceId, targetWorkspaceId), eq(wm.userId, userId)),
+  const { membership, superAdmin } = await runWithRlsContext({ userId }, async () => {
+    const membership = await db.query.workspaceMembers.findFirst({
+      where: (wm, { eq, and }) =>
+        and(eq(wm.workspaceId, targetWorkspaceId), eq(wm.userId, userId)),
+    });
+    return { membership, superAdmin: membership ? false : await isSuperAdmin(userId) };
   });
 
-  if (!membership) {
+  if (!membership && !superAdmin) {
     return NextResponse.json({ error: "Not a member of that workspace" }, { status: 403 });
   }
 
-  const res = NextResponse.json({ activeWorkspaceId: targetWorkspaceId, role: membership.role });
+  const role = membership?.role ?? "ADMIN";
+  const res = NextResponse.json({ activeWorkspaceId: targetWorkspaceId, role });
   res.cookies.set(ACTIVE_WORKSPACE_COOKIE, targetWorkspaceId, {
     httpOnly: true,
     sameSite: "lax",

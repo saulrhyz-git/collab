@@ -27,6 +27,7 @@ import {
   activityLogs,
 } from "../db/schema";
 import { sendInviteEmail, sendInAppNotification } from "./notifications";
+import { isSuperAdmin } from "../auth/super-admin";
 
 const INVITE_TTL_MS = 7 * 24 * 60 * 60 * 1000; // 7 days
 
@@ -44,6 +45,8 @@ function hashToken(raw: string): string {
 async function assertCanInvite(projectId: string, inviterId: string) {
   const project = await db.query.projects.findFirst({ where: eq(projects.id, projectId) });
   if (!project) throw new InvalidInviteError("Project not found.");
+
+  if (await isSuperAdmin(inviterId)) return project;
 
   const workspaceMembership = await db.query.workspaceMembers.findFirst({
     where: and(eq(workspaceMembers.workspaceId, project.workspaceId), eq(workspaceMembers.userId, inviterId)),
@@ -275,7 +278,7 @@ export async function revokeProjectInvite(params: { inviteId: string; actingUser
   });
   const isWorkspaceAdmin = workspaceMembership?.role === "OWNER" || workspaceMembership?.role === "ADMIN";
 
-  if (invite.inviterId !== params.actingUserId && !isWorkspaceAdmin) {
+  if (invite.inviterId !== params.actingUserId && !isWorkspaceAdmin && !(await isSuperAdmin(params.actingUserId))) {
     throw new NotAuthorizedError("Only the inviter or a workspace admin can revoke this invitation.");
   }
 
@@ -306,22 +309,24 @@ export async function listProjectInvitations(params: {
   const project = await db.query.projects.findFirst({ where: eq(projects.id, params.projectId) });
   if (!project) throw new InvalidInviteError("Project not found.");
 
-  const workspaceMembership = await db.query.workspaceMembers.findFirst({
-    where: and(
-      eq(workspaceMembers.workspaceId, project.workspaceId),
-      eq(workspaceMembers.userId, params.requestingUserId)
-    ),
-  });
-  const isWorkspaceAdmin = workspaceMembership?.role === "OWNER" || workspaceMembership?.role === "ADMIN";
+  if (!(await isSuperAdmin(params.requestingUserId))) {
+    const workspaceMembership = await db.query.workspaceMembers.findFirst({
+      where: and(
+        eq(workspaceMembers.workspaceId, project.workspaceId),
+        eq(workspaceMembers.userId, params.requestingUserId)
+      ),
+    });
+    const isWorkspaceAdmin = workspaceMembership?.role === "OWNER" || workspaceMembership?.role === "ADMIN";
 
-  const projectMembership = await db.query.projectMembers.findFirst({
-    where: and(eq(projectMembers.projectId, params.projectId), eq(projectMembers.userId, params.requestingUserId)),
-  });
-  const isProjectAdminOrEditor =
-    projectMembership?.role === "PROJECT_ADMIN" || projectMembership?.role === "EDITOR";
+    const projectMembership = await db.query.projectMembers.findFirst({
+      where: and(eq(projectMembers.projectId, params.projectId), eq(projectMembers.userId, params.requestingUserId)),
+    });
+    const isProjectAdminOrEditor =
+      projectMembership?.role === "PROJECT_ADMIN" || projectMembership?.role === "EDITOR";
 
-  if (!isWorkspaceAdmin && !isProjectAdminOrEditor) {
-    throw new NotAuthorizedError("You don't have permission to view this project's invitations.");
+    if (!isWorkspaceAdmin && !isProjectAdminOrEditor) {
+      throw new NotAuthorizedError("You don't have permission to view this project's invitations.");
+    }
   }
 
   return db.query.projectInvitations.findMany({

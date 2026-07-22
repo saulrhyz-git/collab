@@ -7,6 +7,7 @@
 import { NextRequest, NextResponse } from "next/server";
 import { z } from "zod";
 import { auth } from "../../../../auth";
+import { runWithRlsContext } from "../../../../db/client";
 import {
   acceptProjectInvite,
   InvalidInviteError,
@@ -19,7 +20,8 @@ const acceptSchema = z.object({ token: z.string().min(32) });
 
 export async function POST(req: NextRequest) {
   const session = await auth();
-  if (!session?.user?.id) {
+  const userId = session?.user?.id;
+  if (!userId) {
     return NextResponse.json({ error: "Sign in to accept this invitation." }, { status: 401 });
   }
 
@@ -29,11 +31,13 @@ export async function POST(req: NextRequest) {
   }
 
   try {
-    const result = await acceptProjectInvite({
-      inviteTokenOrId: parsed.data.token,
-      acceptingUserId: session.user.id,
-      lookupBy: "token",
-    });
+    const result = await runWithRlsContext({ userId }, () =>
+      acceptProjectInvite({
+        inviteTokenOrId: parsed.data.token,
+        acceptingUserId: userId,
+        lookupBy: "token",
+      })
+    );
     return NextResponse.json(result);
   } catch (err) {
     if (err instanceof InvalidInviteError) return NextResponse.json({ error: err.message }, { status: 404 });

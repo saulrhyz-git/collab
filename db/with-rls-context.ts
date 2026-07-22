@@ -1,25 +1,18 @@
 /**
- * Wraps every authenticated request in a transaction that sets the RLS
- * session GUCs (see db/rls-policies.sql) before running any query, and
- * clears them on the way out. This is the single choke point that makes
- * RLS actually enforce tenant isolation — if a route handler forgets to
- * call this, every query still executes, but every policy will fail closed
- * (current_setting returns '' which matches nothing).
+ * Re-exported for naming continuity — the real implementation lives in
+ * db/client.ts (it needs access to the module-private `poolDb` and the
+ * AsyncLocalStorage instance, so it can't live in a separate file without
+ * also exporting those internals).
+ *
+ * Earlier versions of this file defined a `withRlsContext` that was never
+ * actually called from any route or service — every `db.*` call in the
+ * app ran with no RLS session context set, which under
+ * `FORCE ROW LEVEL SECURITY` means every policy's `current_app_user_id()`
+ * resolved to NULL and every query would have silently returned zero rows
+ * (or failed a WITH CHECK) against a real Postgres instance. The fix
+ * moved the implementation into db/client.ts as `runWithRlsContext`,
+ * backed by AsyncLocalStorage, and wired it into the actual request path:
+ * auth/require-user.ts's `withAuth`, and auth/workspace-context.middleware.ts's
+ * `resolveRequestContext` / `switchActiveWorkspace` / `withWorkspaceContext`.
  */
-
-import { sql } from "drizzle-orm";
-import type { db as dbType } from "./client";
-
-export async function withRlsContext<T>(
-  db: typeof dbType,
-  ctx: { userId: string; workspaceId: string | null },
-  fn: (tx: typeof dbType) => Promise<T>
-): Promise<T> {
-  return db.transaction(async (tx) => {
-    await tx.execute(sql`SELECT set_config('app.current_user_id', ${ctx.userId}, true)`);
-    await tx.execute(
-      sql`SELECT set_config('app.current_workspace_id', ${ctx.workspaceId ?? ""}, true)`
-    );
-    return fn(tx as unknown as typeof dbType);
-  });
-}
+export { runWithRlsContext } from "./client";

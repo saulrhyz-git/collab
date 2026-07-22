@@ -26,6 +26,7 @@ import {
   tasks,
   activityLogs,
 } from "../db/schema";
+import { isSuperAdmin } from "../auth/super-admin";
 
 export class NotAuthorizedError extends Error {}
 export class CannotRemoveOwnerError extends Error {}
@@ -41,7 +42,7 @@ export async function removeWorkspaceMember(params: {
     where: and(eq(workspaceMembers.workspaceId, workspaceId), eq(workspaceMembers.userId, actingUserId)),
   });
   const isAdmin = actingMembership?.role === "OWNER" || actingMembership?.role === "ADMIN";
-  if (!isAdmin && actingUserId !== targetUserId) {
+  if (!isAdmin && actingUserId !== targetUserId && !(await isSuperAdmin(actingUserId))) {
     throw new NotAuthorizedError("Only a workspace admin can remove other members.");
   }
 

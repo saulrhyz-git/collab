@@ -18,6 +18,7 @@ import {
   uuid,
   varchar,
   text,
+  boolean,
   timestamp,
   integer,
   jsonb,
@@ -86,6 +87,11 @@ export const users = pgTable("users", {
   fullName: varchar("full_name", { length: 200 }).notNull(),
   avatarUrl: text("avatar_url"),
   emailVerifiedAt: timestamp("email_verified_at", { withTimezone: true }),
+  // Platform-wide bypass of workspace/project membership checks — see
+  // db/rls-policies.sql's is_super_admin() and auth/super-admin.ts. Not
+  // exposed through any signup flow; only ever set by a trusted operator
+  // (scripts/seed-superadmin.ts, or a direct DB update).
+  isSuperAdmin: boolean("is_super_admin").notNull().default(false),
   createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
   updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
 }, (t) => ({

@@ -1,6 +1,7 @@
-import { eq } from "drizzle-orm";
+import { eq, and } from "drizzle-orm";
 import { db } from "../db/client";
 import { workspaces, workspaceMembers, activityLogs } from "../db/schema";
+import { isSuperAdmin } from "../auth/super-admin";
 
 export class NotFoundError extends Error {}
 
@@ -13,6 +14,26 @@ export interface WorkspaceSummary {
 
 /** All workspaces the user belongs to, personal workspace included, for the switcher UI. */
 export async function listWorkspacesForUser(userId: string): Promise<WorkspaceSummary[]> {
+  if (await isSuperAdmin(userId)) {
+    // Every workspace in the system, not just ones they've joined — that's
+    // the point of "platform-wide". Report their real role where they
+    // happen to also be an actual member (so their own personal workspace
+    // still shows OWNER), and a synthetic "ADMIN" everywhere else.
+    const rows = await db
+      .select({
+        id: workspaces.id,
+        name: workspaces.name,
+        type: workspaces.type,
+        role: workspaceMembers.role,
+      })
+      .from(workspaces)
+      .leftJoin(
+        workspaceMembers,
+        and(eq(workspaceMembers.workspaceId, workspaces.id), eq(workspaceMembers.userId, userId))
+      );
+    return rows.map((r) => ({ id: r.id, name: r.name, type: r.type, role: r.role ?? "ADMIN" }));
+  }
+
   const rows = await db
     .select({
       id: workspaces.id,

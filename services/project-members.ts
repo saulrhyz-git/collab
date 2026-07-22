@@ -8,6 +8,7 @@ import {
   tasks,
   activityLogs,
 } from "../db/schema";
+import { isSuperAdmin } from "../auth/super-admin";
 
 export class NotAuthorizedError extends Error {}
 export class NotFoundError extends Error {}
@@ -22,6 +23,7 @@ async function getProjectOrThrow(projectId: string) {
 }
 
 async function isWorkspaceAdmin(workspaceId: string, userId: string) {
+  if (await isSuperAdmin(userId)) return true;
   const m = await db.query.workspaceMembers.findFirst({
     where: and(eq(workspaceMembers.workspaceId, workspaceId), eq(workspaceMembers.userId, userId)),
   });

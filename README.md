@@ -18,13 +18,7 @@ Requirements: Node 20+, Docker (for local Postgres) or your own Postgres 16 inst
    docker compose up -d
    ```
 
-3. Copy the env file and fill in real values:
-
-   ```bash
-   cp .env.example .env
-   ```
-
-   Generate `AUTH_SECRET` with `npx auth secret`, or any random 32-byte value.
+3. A `.env` already exists in this folder (gitignored, not committed) with a generated `AUTH_SECRET` and the super-admin credentials from step 8 below pre-filled. If you're setting this up somewhere else, copy `.env.example` instead and fill in real values — generate `AUTH_SECRET` with `npx auth secret`.
 
 4. Push the schema to the database (creates tables + enums; RLS policies are separate — see below):
 
@@ -52,16 +46,25 @@ Requirements: Node 20+, Docker (for local Postgres) or your own Postgres 16 inst
    npm run socket
    ```
 
+8. Seed the local super-admin account (credentials come from `.env` — see `SEED_SUPERADMIN_*`):
+
+   ```bash
+   npm run db:seed
+   ```
+
+   This creates (or promotes, if it already exists) the account and flips `is_super_admin` on it. A super admin bypasses workspace/project membership checks everywhere — every workspace shows up in their switcher, they can manage any project's members and tasks, and RLS independently enforces the same bypass at the database level (see `auth/super-admin.ts` and the `is_super_admin()` function in `db/rls-policies.sql`). It's a genuine platform-wide override, not scoped to any one workspace — treat the password like the keys to everything.
+
 ### Other useful scripts
 
 - `npm run typecheck` — `tsc --noEmit` across the whole project.
 - `npm run db:studio` — Drizzle Studio, a GUI for browsing the database.
 - `npm run db:generate` — generate a versioned SQL migration from schema changes instead of `db:push` (recommended once you have real data you don't want to risk with a diff-and-apply push).
+- `npm run db:seed` — create/promote the local super-admin account from `.env`.
 
 ### Notes on what's stubbed
 
 - `services/notifications.ts` logs to the console instead of actually sending email — swap in a real provider (Resend, SES, Postmark) before this goes further than local use.
-- There's no seed script yet; the fastest way to get a second test user is to sign up a second account in an incognito window and invite it to a project from the first account's UI (once you wire a project page up to `components/KanbanBoard.tsx` and `ProjectCollaboratorModal.tsx` — the dashboard shell at `app/page.tsx` is currently a minimal placeholder that only renders the workspace switcher).
+- Beyond the seeded super admin, the fastest way to get a second test user is to sign up a second account in an incognito window and invite it to a project from the first account's UI (once you wire a project page up to `components/KanbanBoard.tsx` and `ProjectCollaboratorModal.tsx` — the dashboard shell at `app/page.tsx` is currently a minimal placeholder that only renders the workspace switcher).
 
 ## File map
 

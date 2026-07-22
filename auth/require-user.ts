@@ -18,6 +18,7 @@
 
 import { NextRequest, NextResponse } from "next/server";
 import { auth } from "./index";
+import { runWithRlsContext } from "../db/client";
 
 export class UnauthenticatedError extends Error {}
 
@@ -46,15 +47,19 @@ export function mapDomainError(err: unknown): NextResponse | null {
       return NextResponse.json({ error: (err as Error).message || "Conflict" }, { status: 409 });
     case "InviteExpiredError":
       return NextResponse.json({ error: (err as Error).message || "Expired" }, { status: 410 });
+    case "CannotRemoveLastAdminError":
+      return NextResponse.json({ error: (err as Error).message || "Conflict" }, { status: 409 });
     default:
       return null;
   }
 }
 
 /**
- * Wraps a route handler: resolves the caller's user id, maps any thrown
- * domain error (by constructor name — see mapDomainError) to the right
- * HTTP status, and re-throws anything unrecognized as a 500.
+ * Wraps a route handler: resolves the caller's user id, establishes the
+ * RLS session context for the DB connection used by everything `fn` (and
+ * anything it calls, arbitrarily deep — see db/client.ts) touches, maps
+ * any thrown domain error (by constructor name — see mapDomainError) to
+ * the right HTTP status, and re-throws anything unrecognized as a 500.
  */
 export function withAuth(
   fn: (req: NextRequest, userId: string, params: Record<string, string>) => Promise<NextResponse>
@@ -63,7 +68,7 @@ export function withAuth(
     try {
       const userId = await requireUserId();
       const params = await (routeCtx as any).params;
-      return await fn(req, userId, params);
+      return await runWithRlsContext({ userId }, () => fn(req, userId, params));
     } catch (err) {
       const mapped = mapDomainError(err);
       if (mapped) return mapped;

@@ -8,7 +8,8 @@
 import { createServer } from "http";
 import { Server } from "socket.io";
 import { parse } from "cookie";
-import { db } from "../db/client";
+import { db, runWithRlsContext } from "../db/client";
+import { isSuperAdmin } from "../auth/super-admin";
 import { decode } from "next-auth/jwt";
 
 const httpServer = createServer();
@@ -36,10 +37,19 @@ io.use(async (socket, next) => {
     if (!token?.userId) return next(new Error("unauthenticated"));
 
     const projectId = socket.handshake.query.projectId as string;
-    const membership = await db.query.projectMembers.findFirst({
-      where: (pm, { eq, and }) => and(eq(pm.projectId, projectId), eq(pm.userId, token.userId as string)),
+    const userId = token.userId as string;
+
+    // This connection has no per-request wrapper to fall back on the way
+    // HTTP routes do (see auth/require-user.ts) — it has to establish its
+    // own RLS session context before touching project_members, which is
+    // FORCE ROW LEVEL SECURITY-protected.
+    const allowed = await runWithRlsContext({ userId }, async () => {
+      const membership = await db.query.projectMembers.findFirst({
+        where: (pm, { eq, and }) => and(eq(pm.projectId, projectId), eq(pm.userId, userId)),
+      });
+      return membership !== undefined || (await isSuperAdmin(userId));
     });
-    if (!membership) return next(new Error("forbidden"));
+    if (!allowed) return next(new Error("forbidden"));
 
     socket.data.userId = token.userId;
     socket.data.projectId = projectId;

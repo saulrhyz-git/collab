@@ -1,13 +1,14 @@
 /**
  * Signup service — creates the user row and their default PERSONAL
- * workspace atomically. Runs OUTSIDE withRlsContext because at signup
- * time there is no authenticated user yet to set app.current_user_id to;
- * instead this uses a single DB transaction with direct inserts under a
- * role that's allowed to bypass the "no direct INSERT policy" restriction
- * on `workspaces` (see rls-policies.sql comment) via a SECURITY DEFINER
- * function. Simpler alternative used here: do the inserts in a plain
- * transaction, then immediately re-derive the session so all *subsequent*
- * requests go through withRlsContext as normal.
+ * workspace atomically. There's no session to derive app.current_user_id
+ * from yet (the account doesn't exist until partway through this
+ * function), so this manages its own transaction and sets the RLS session
+ * GUC manually right after the user row is created — everything after
+ * that point (the workspace + membership + activity log inserts) runs
+ * with a real `current_app_user_id()`, satisfying the `workspaces_insert`
+ * / `workspace_members_insert` policies' `owner_id = current_app_user_id()`
+ * bootstrap checks (see db/rls-policies.sql). `users` itself has no RLS
+ * policies at all — email lookup has to work before any session exists.
  */
 
 import { hash } from "bcryptjs";
@@ -44,10 +45,6 @@ export async function signupUser(input: SignupInput): Promise<SignupResult> {
   const passwordHash = await hash(input.password, 12);
 
   return db.transaction(async (tx) => {
-    // Bypass RLS for this bootstrap transaction only — the db role used
-    // here is a privileged "signup" role granted BYPASSRLS, distinct from
-    // the general application role used by withRlsContext. Never reuse
-    // this connection/role for anything beyond signup.
     const [user] = await tx
       .insert(users)
       .values({
@@ -56,6 +53,10 @@ export async function signupUser(input: SignupInput): Promise<SignupResult> {
         fullName: input.fullName.trim(),
       })
       .returning();
+
+    // From here on, every insert in this transaction needs
+    // current_app_user_id() to resolve to the account we just created.
+    await tx.execute(sql`SELECT set_config('app.current_user_id', ${user.id}, true)`);
 
     const [personalWorkspace] = await tx
       .insert(workspaces)
