@@ -12,12 +12,11 @@
  */
 
 import mammoth from "mammoth";
-
-// pdf-parse's package entrypoint runs a debug self-test on import when
-// required in certain bundling contexts; importing the internal lib path
-// avoids that entirely and is the pattern the library's own README
-// recommends for library (non-CLI) usage.
-import pdfParse from "pdf-parse/lib/pdf-parse.js";
+// pdf-parse's root export is what @types/pdf-parse declares types for.
+// (Its debug self-test in index.js is gated on `!module.parent`, so it
+// never fires when the package is required as a module like this — only
+// when run directly as a script.)
+import pdfParse from "pdf-parse";
 
 const MAX_CHARS = 100_000;
 
