@@ -9,6 +9,17 @@
  * / `workspace_members_insert` policies' `owner_id = current_app_user_id()`
  * bootstrap checks (see db/rls-policies.sql). `users` itself has no RLS
  * policies at all — email lookup has to work before any session exists.
+ *
+ * The workspace id is generated here (not left to Postgres's column
+ * default) and the insert is deliberately NOT `.returning()`'d. Postgres
+ * re-checks a table's SELECT policy against the row an INSERT/UPDATE
+ * returns — and `workspaces_select` requires `is_workspace_member(id)`,
+ * which is false at this exact instant (the membership row that would
+ * satisfy it doesn't exist until the very next statement). Asking for
+ * `.returning()` here would fail with "new row violates row-level security
+ * policy for table workspaces" for every ordinary signup. Once the
+ * membership row is inserted, a plain SELECT on that same workspace id
+ * passes the policy fine, so that's how the caller gets the full row back.
  */
 
 // bcryptjs's CJS bundle doesn't expose statically-analyzable named exports
@@ -17,6 +28,7 @@
 // same way `pg`'s `Pool` does — see db/client.ts for the longer version.
 import bcryptjs from "bcryptjs";
 const { hash } = bcryptjs;
+import { randomUUID } from "node:crypto";
 import { db } from "../db/client";
 import { users, workspaces, workspaceMembers } from "../db/schema";
 import { sql } from "drizzle-orm";
@@ -63,28 +75,27 @@ export async function signupUser(input: SignupInput): Promise<SignupResult> {
     // current_app_user_id() to resolve to the account we just created.
     await tx.execute(sql`SELECT set_config('app.current_user_id', ${user.id}, true)`);
 
-    const [personalWorkspace] = await tx
-      .insert(workspaces)
-      .values({
-        name: `${input.fullName.trim()}'s Workspace`,
-        type: "PERSONAL",
-        ownerId: user.id,
-        slug: await generateUniqueSlug(tx, input.fullName),
-      })
-      .returning();
+    const workspaceId = randomUUID();
+    await tx.insert(workspaces).values({
+      id: workspaceId,
+      name: `${input.fullName.trim()}'s Workspace`,
+      type: "PERSONAL",
+      ownerId: user.id,
+      slug: await generateUniqueSlug(tx, input.fullName),
+    });
 
     await tx.insert(workspaceMembers).values({
-      workspaceId: personalWorkspace.id,
+      workspaceId,
       userId: user.id,
       role: "OWNER",
     });
 
     await tx.execute(sql`
       INSERT INTO activity_logs (workspace_id, user_id, action, metadata)
-      VALUES (${personalWorkspace.id}, ${user.id}, 'workspace.created', '{"reason": "signup_default"}'::jsonb)
+      VALUES (${workspaceId}, ${user.id}, 'workspace.created', '{"reason": "signup_default"}'::jsonb)
     `);
 
-    return { userId: user.id, personalWorkspaceId: personalWorkspace.id };
+    return { userId: user.id, personalWorkspaceId: workspaceId };
   });
 }
 

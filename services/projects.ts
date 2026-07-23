@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import { eq, and, isNull } from "drizzle-orm";
 import { db } from "../db/client";
 import { projects, projectMembers, workspaceMembers, activityLogs, clients } from "../db/schema";
@@ -21,6 +22,17 @@ async function isWorkspaceMember(workspaceId: string, userId: string) {
  * added as PROJECT_ADMIN — otherwise nobody could manage the project they
  * just made (workspace membership alone doesn't imply project membership
  * for PRIVATE_TO_MEMBERS projects).
+ *
+ * Insert order note: `projects_select`'s policy (`can_access_project`)
+ * requires either a PUBLIC_TO_WORKSPACE visibility or an existing
+ * `project_members` row — neither is true yet at the instant the project
+ * is inserted (the default is PRIVATE_TO_MEMBERS, and the creator's own
+ * PROJECT_ADMIN membership row is the very next statement). Postgres
+ * re-checks a table's SELECT policy against an INSERT's `.returning()`
+ * output, so doing that here would fail with "new row violates row-level
+ * security policy" for the default (private) case. Same fix as
+ * services/workspaces.ts: pre-generate the id, insert without
+ * `.returning()`, insert the membership row, then plain-SELECT it back.
  */
 export async function createProject(params: {
   workspaceId: string;
@@ -45,33 +57,33 @@ export async function createProject(params: {
   }
 
   return db.transaction(async (tx) => {
-    const [project] = await tx
-      .insert(projects)
-      .values({
-        workspaceId: params.workspaceId,
-        name,
-        description: params.description,
-        visibility: params.visibility ?? "PRIVATE_TO_MEMBERS",
-        createdBy: params.createdBy,
-        clientId: params.clientId ?? null,
-      })
-      .returning();
+    const projectId = randomUUID();
+    await tx.insert(projects).values({
+      id: projectId,
+      workspaceId: params.workspaceId,
+      name,
+      description: params.description,
+      visibility: params.visibility ?? "PRIVATE_TO_MEMBERS",
+      createdBy: params.createdBy,
+      clientId: params.clientId ?? null,
+    });
 
     await tx.insert(projectMembers).values({
-      projectId: project.id,
+      projectId,
       userId: params.createdBy,
       role: "PROJECT_ADMIN",
     });
 
     await tx.insert(activityLogs).values({
       workspaceId: params.workspaceId,
-      projectId: project.id,
+      projectId,
       userId: params.createdBy,
       action: "project.created",
       metadata: { name },
     });
 
-    return project;
+    const project = await tx.query.projects.findFirst({ where: eq(projects.id, projectId) });
+    return project!;
   });
 }
 

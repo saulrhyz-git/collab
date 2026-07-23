@@ -32,6 +32,8 @@ Requirements: Node 20+, Docker (for local Postgres) or your own Postgres 16 inst
    psql "$DATABASE_URL" -f db/rls-policies.sql
    ```
 
+   This needs to be run by a **superuser** connection (the default docker-compose Postgres's `app` user already is one — for your own Postgres instance, connect as `postgres` or whichever role has `SUPERUSER`, not necessarily the same role the app's `DATABASE_URL` uses day to day). The script creates a narrowly-scoped, no-login `rls_helper` role with the `BYPASSRLS` attribute — required so a couple of membership-check functions can query `workspace_members`/`project_members` without recursing into the very policy that's calling them (see the comment above `is_workspace_member()` in the file for why). If you run it as a non-superuser and it fails on the `CREATE ROLE ... BYPASSRLS` step with "permission denied", re-connect as a superuser and re-run the file — it's safe to run more than once.
+
 6. Start the app:
 
    ```bash
@@ -56,14 +58,21 @@ Requirements: Node 20+, Docker (for local Postgres) or your own Postgres 16 inst
 
 ### Updating an already-running install
 
-If you already had this app running before the clients/dashboard feature landed, the new `clients` table and `projects.client_id` column need to be added to your existing database — pull the code, then re-run steps 4 and 5:
+If you already had this app running, re-run steps 4 and 5 after pulling new code — both the clients/dashboard feature (new `clients` table, `projects.client_id`) and the RLS fixes below (existing tables, policies only) need it:
 
 ```bash
 npm run db:push
-psql "$DATABASE_URL" -f db/rls-policies.sql
+psql "$DATABASE_URL" -f db/rls-policies.sql   # must be a superuser connection — see below
 ```
 
 `db:push` only adds what's new (it won't touch your existing rows), and `rls-policies.sql` is idempotent (`CREATE OR REPLACE FUNCTION`, `CREATE POLICY` guarded by the policies being dropped/recreated on each run) — safe to re-run any time the schema or policies change. Restart `npm run dev` afterward.
+
+**This one is not optional if you set up the app before this note was added.** Two real bugs in `db/rls-policies.sql` meant an ordinary (non-super-admin) account couldn't reliably sign up, log back in, or create a project — masked in earlier testing because everything was exercised through the seeded super admin, which bypasses both:
+
+- **`stack depth limit exceeded`** on ordinary requests. `is_workspace_member()`, `is_workspace_admin()`, and `is_project_member()` each query `workspace_members`/`project_members` to check membership — but those two tables' OWN row-security policies call the same functions, so evaluating one re-triggered the policy that was calling it, forever, until Postgres gave up. Fixed by making the three functions `SECURITY DEFINER`, owned by a new `rls_helper` role with the `BYPASSRLS` attribute, so their internal lookups skip row security instead of recursing into it.
+- **`new row violates row-level security policy`** on ordinary signup and project creation. Two compounding issues: (1) a few bootstrap inserts (a brand-new personal workspace, a brand-new project) asked Postgres to `RETURNING` the row they'd just created, but the row's SELECT policy required a membership row that only existed after the *next* statement — fixed in `auth/signup.ts`, `services/workspaces.ts`, and `services/projects.ts` by pre-generating the id, dropping `.returning()`, and re-`SELECT`ing after the membership row exists. (2) `project_members_insert` had no branch at all for "the project's own creator adding themselves as `PROJECT_ADMIN`" — anyone who wasn't already a workspace admin creating a project would hit this. Fixed by adding that bootstrap branch, plus new bypass helper functions (`is_workspace_owner`, `project_workspace_id`, `is_project_creator`, `has_pending_workspace_invite`, `has_pending_project_invite`) for every other spot where a policy needed to check a fact about a row it couldn't yet see under its own table's RLS.
+
+Both classes of bug were verified against a real (embedded) Postgres instance end to end — signup, shared-workspace creation, project creation as an ordinary member, and invite acceptance for an invite sent before the invitee had an account — before and after the fix.
 
 ### Other useful scripts
 

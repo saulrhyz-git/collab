@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import { eq, and } from "drizzle-orm";
 import { db } from "../db/client";
 import { workspaces, workspaceMembers, activityLogs } from "../db/schema";
@@ -56,30 +57,40 @@ export async function listWorkspacesForUser(userId: string): Promise<WorkspaceSu
     .map(({ id, name, type, role }) => ({ id, name, type, role }));
 }
 
+/**
+ * Note on the insert order below: `workspaces_select`'s RLS policy requires
+ * `is_workspace_member(id)`, which is false until the OWNER membership row
+ * exists — and Postgres re-checks a table's SELECT policy against whatever
+ * an INSERT/UPDATE `.returning()`s. Asking for the new workspace back in
+ * the same statement that creates it would fail with "new row violates
+ * row-level security policy" for every ordinary (non-super-admin) caller.
+ * So: generate the id up front, insert without `.returning()`, insert the
+ * membership row, then plain-SELECT the workspace — which passes the
+ * policy fine now that the membership row backing it exists.
+ */
 export async function createSharedWorkspace(params: { ownerId: string; name: string }) {
   const name = params.name.trim();
   if (!name) throw new Error("Workspace name is required.");
 
   return db.transaction(async (tx) => {
-    const [ws] = await tx
-      .insert(workspaces)
-      .values({ name, type: "SHARED", ownerId: params.ownerId })
-      .returning();
+    const workspaceId = randomUUID();
+    await tx.insert(workspaces).values({ id: workspaceId, name, type: "SHARED", ownerId: params.ownerId });
 
     await tx.insert(workspaceMembers).values({
-      workspaceId: ws.id,
+      workspaceId,
       userId: params.ownerId,
       role: "OWNER",
     });
 
     await tx.insert(activityLogs).values({
-      workspaceId: ws.id,
+      workspaceId,
       userId: params.ownerId,
       action: "workspace.created",
       metadata: { type: "SHARED" },
     });
 
-    return ws;
+    const ws = await tx.query.workspaces.findFirst({ where: eq(workspaces.id, workspaceId) });
+    return ws!;
   });
 }
 
