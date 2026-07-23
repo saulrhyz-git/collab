@@ -91,12 +91,15 @@ $$ LANGUAGE sql STABLE;
 ALTER TABLE workspaces ENABLE ROW LEVEL SECURITY;
 ALTER TABLE workspaces FORCE ROW LEVEL SECURITY; -- applies even to the table owner role
 
+DROP POLICY IF EXISTS workspaces_select ON workspaces;
 CREATE POLICY workspaces_select ON workspaces
   FOR SELECT USING (is_workspace_member(id));
 
+DROP POLICY IF EXISTS workspaces_update ON workspaces;
 CREATE POLICY workspaces_update ON workspaces
   FOR UPDATE USING (is_workspace_admin(id));
 
+DROP POLICY IF EXISTS workspaces_delete ON workspaces;
 CREATE POLICY workspaces_delete ON workspaces
   FOR DELETE USING (owner_id = current_app_user_id() OR is_super_admin());
 
@@ -104,6 +107,7 @@ CREATE POLICY workspaces_delete ON workspaces
 -- against current_app_user_id(), not the client-supplied owner_id — see
 -- auth/signup.ts and services/workspaces.ts, both of which set the RLS
 -- session to the owner's own id before this insert runs).
+DROP POLICY IF EXISTS workspaces_insert ON workspaces;
 CREATE POLICY workspaces_insert ON workspaces
   FOR INSERT WITH CHECK (owner_id = current_app_user_id() OR is_super_admin());
 
@@ -113,9 +117,11 @@ CREATE POLICY workspaces_insert ON workspaces
 ALTER TABLE workspace_members ENABLE ROW LEVEL SECURITY;
 ALTER TABLE workspace_members FORCE ROW LEVEL SECURITY;
 
+DROP POLICY IF EXISTS workspace_members_select ON workspace_members;
 CREATE POLICY workspace_members_select ON workspace_members
   FOR SELECT USING (is_workspace_member(workspace_id));
 
+DROP POLICY IF EXISTS workspace_members_insert ON workspace_members;
 CREATE POLICY workspace_members_insert ON workspace_members
   FOR INSERT WITH CHECK (
     is_workspace_admin(workspace_id)
@@ -148,9 +154,11 @@ CREATE POLICY workspace_members_insert ON workspace_members
     )
   );
 
+DROP POLICY IF EXISTS workspace_members_update ON workspace_members;
 CREATE POLICY workspace_members_update ON workspace_members
   FOR UPDATE USING (is_workspace_admin(workspace_id));
 
+DROP POLICY IF EXISTS workspace_members_delete ON workspace_members;
 CREATE POLICY workspace_members_delete ON workspace_members
   FOR DELETE USING (
     is_workspace_admin(workspace_id)
@@ -158,17 +166,49 @@ CREATE POLICY workspace_members_delete ON workspace_members
   );
 
 -- ---------------------------------------------------------------------------
+-- clients — a workspace's roster of external parties. No separate
+-- "client_members" concept: visibility follows plain workspace membership
+-- (unlike projects, clients have no per-row privacy setting — a client
+-- record is metadata about who you work with, not itself sensitive project
+-- content), and any workspace member can create one, same latitude as
+-- projects_insert. Editing is restricted to whoever created the record or a
+-- workspace admin, so one team member can't silently rewrite another's
+-- client notes/contact info.
+-- ---------------------------------------------------------------------------
+ALTER TABLE clients ENABLE ROW LEVEL SECURITY;
+ALTER TABLE clients FORCE ROW LEVEL SECURITY;
+
+DROP POLICY IF EXISTS clients_select ON clients;
+CREATE POLICY clients_select ON clients
+  FOR SELECT USING (is_workspace_member(workspace_id));
+
+DROP POLICY IF EXISTS clients_insert ON clients;
+CREATE POLICY clients_insert ON clients
+  FOR INSERT WITH CHECK (is_workspace_member(workspace_id) AND created_by = current_app_user_id());
+
+DROP POLICY IF EXISTS clients_update ON clients;
+CREATE POLICY clients_update ON clients
+  FOR UPDATE USING (is_workspace_admin(workspace_id) OR created_by = current_app_user_id());
+
+DROP POLICY IF EXISTS clients_delete ON clients;
+CREATE POLICY clients_delete ON clients
+  FOR DELETE USING (is_workspace_admin(workspace_id));
+
+-- ---------------------------------------------------------------------------
 -- projects
 -- ---------------------------------------------------------------------------
 ALTER TABLE projects ENABLE ROW LEVEL SECURITY;
 ALTER TABLE projects FORCE ROW LEVEL SECURITY;
 
+DROP POLICY IF EXISTS projects_select ON projects;
 CREATE POLICY projects_select ON projects
   FOR SELECT USING (can_access_project(id, workspace_id, visibility));
 
+DROP POLICY IF EXISTS projects_insert ON projects;
 CREATE POLICY projects_insert ON projects
   FOR INSERT WITH CHECK (is_workspace_member(workspace_id));
 
+DROP POLICY IF EXISTS projects_update ON projects;
 CREATE POLICY projects_update ON projects
   FOR UPDATE USING (
     is_workspace_admin(workspace_id)
@@ -178,6 +218,7 @@ CREATE POLICY projects_update ON projects
     )
   );
 
+DROP POLICY IF EXISTS projects_delete ON projects;
 CREATE POLICY projects_delete ON projects
   FOR DELETE USING (is_workspace_admin(workspace_id));
 
@@ -187,6 +228,7 @@ CREATE POLICY projects_delete ON projects
 ALTER TABLE project_members ENABLE ROW LEVEL SECURITY;
 ALTER TABLE project_members FORCE ROW LEVEL SECURITY;
 
+DROP POLICY IF EXISTS project_members_select ON project_members;
 CREATE POLICY project_members_select ON project_members
   FOR SELECT USING (
     is_project_member(project_id)
@@ -196,6 +238,7 @@ CREATE POLICY project_members_select ON project_members
     )
   );
 
+DROP POLICY IF EXISTS project_members_insert ON project_members;
 CREATE POLICY project_members_insert ON project_members
   FOR INSERT WITH CHECK (
     EXISTS (
@@ -225,6 +268,7 @@ CREATE POLICY project_members_insert ON project_members
     )
   );
 
+DROP POLICY IF EXISTS project_members_delete ON project_members;
 CREATE POLICY project_members_delete ON project_members
   FOR DELETE USING (
     user_id = current_app_user_id() -- self-removal
@@ -240,6 +284,7 @@ CREATE POLICY project_members_delete ON project_members
 ALTER TABLE project_invitations ENABLE ROW LEVEL SECURITY;
 ALTER TABLE project_invitations FORCE ROW LEVEL SECURITY;
 
+DROP POLICY IF EXISTS project_invitations_select ON project_invitations;
 CREATE POLICY project_invitations_select ON project_invitations
   FOR SELECT USING (
     inviter_id = current_app_user_id()
@@ -247,12 +292,14 @@ CREATE POLICY project_invitations_select ON project_invitations
     OR is_workspace_admin(workspace_id)
   );
 
+DROP POLICY IF EXISTS project_invitations_insert ON project_invitations;
 CREATE POLICY project_invitations_insert ON project_invitations
   FOR INSERT WITH CHECK (
     inviter_id = current_app_user_id()
     AND (is_workspace_admin(workspace_id) OR is_project_member(project_id))
   );
 
+DROP POLICY IF EXISTS project_invitations_update ON project_invitations;
 CREATE POLICY project_invitations_update ON project_invitations
   FOR UPDATE USING (
     inviter_id = current_app_user_id()
@@ -270,6 +317,7 @@ CREATE POLICY project_invitations_update ON project_invitations
 ALTER TABLE tasks ENABLE ROW LEVEL SECURITY;
 ALTER TABLE tasks FORCE ROW LEVEL SECURITY;
 
+DROP POLICY IF EXISTS tasks_select ON tasks;
 CREATE POLICY tasks_select ON tasks
   FOR SELECT USING (
     EXISTS (
@@ -278,6 +326,7 @@ CREATE POLICY tasks_select ON tasks
     )
   );
 
+DROP POLICY IF EXISTS tasks_write ON tasks;
 CREATE POLICY tasks_write ON tasks
   FOR ALL USING (
     EXISTS (
@@ -298,6 +347,7 @@ CREATE POLICY tasks_write ON tasks
 ALTER TABLE task_dependencies ENABLE ROW LEVEL SECURITY;
 ALTER TABLE task_dependencies FORCE ROW LEVEL SECURITY;
 
+DROP POLICY IF EXISTS task_dependencies_select ON task_dependencies;
 CREATE POLICY task_dependencies_select ON task_dependencies
   FOR SELECT USING (
     EXISTS (
@@ -307,6 +357,7 @@ CREATE POLICY task_dependencies_select ON task_dependencies
     )
   );
 
+DROP POLICY IF EXISTS task_dependencies_write ON task_dependencies;
 CREATE POLICY task_dependencies_write ON task_dependencies
   FOR ALL USING (
     EXISTS (
@@ -330,6 +381,7 @@ CREATE POLICY task_dependencies_write ON task_dependencies
 ALTER TABLE task_comments ENABLE ROW LEVEL SECURITY;
 ALTER TABLE task_comments FORCE ROW LEVEL SECURITY;
 
+DROP POLICY IF EXISTS task_comments_select ON task_comments;
 CREATE POLICY task_comments_select ON task_comments
   FOR SELECT USING (
     EXISTS (
@@ -339,6 +391,7 @@ CREATE POLICY task_comments_select ON task_comments
     )
   );
 
+DROP POLICY IF EXISTS task_comments_insert ON task_comments;
 CREATE POLICY task_comments_insert ON task_comments
   FOR INSERT WITH CHECK (
     author_id = current_app_user_id()
@@ -349,6 +402,7 @@ CREATE POLICY task_comments_insert ON task_comments
     )
   );
 
+DROP POLICY IF EXISTS task_comments_delete ON task_comments;
 CREATE POLICY task_comments_delete ON task_comments
   FOR DELETE USING (
     author_id = current_app_user_id()
@@ -361,9 +415,11 @@ CREATE POLICY task_comments_delete ON task_comments
 ALTER TABLE activity_logs ENABLE ROW LEVEL SECURITY;
 ALTER TABLE activity_logs FORCE ROW LEVEL SECURITY;
 
+DROP POLICY IF EXISTS activity_logs_select ON activity_logs;
 CREATE POLICY activity_logs_select ON activity_logs
   FOR SELECT USING (is_workspace_member(workspace_id));
 
+DROP POLICY IF EXISTS activity_logs_insert ON activity_logs;
 CREATE POLICY activity_logs_insert ON activity_logs
   FOR INSERT WITH CHECK (is_workspace_member(workspace_id));
 

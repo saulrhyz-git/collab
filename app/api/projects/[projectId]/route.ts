@@ -13,6 +13,7 @@ const updateSchema = z.object({
   name: z.string().min(1).max(200).optional(),
   description: z.string().optional(),
   visibility: z.enum(["PUBLIC_TO_WORKSPACE", "PRIVATE_TO_MEMBERS"]).optional(),
+  clientId: z.string().uuid().nullable().optional(),
 });
 
 export const GET = withAuth(async (_req, userId, params) => {

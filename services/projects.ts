@@ -1,6 +1,6 @@
 import { eq, and, isNull } from "drizzle-orm";
 import { db } from "../db/client";
-import { projects, projectMembers, workspaceMembers, activityLogs } from "../db/schema";
+import { projects, projectMembers, workspaceMembers, activityLogs, clients } from "../db/schema";
 import { isSuperAdmin } from "../auth/super-admin";
 
 export class NotAuthorizedError extends Error {}
@@ -28,12 +28,20 @@ export async function createProject(params: {
   name: string;
   description?: string;
   visibility?: ProjectVisibility;
+  clientId?: string | null;
 }) {
   const name = params.name.trim();
   if (!name) throw new Error("Project name is required.");
 
   if (!(await isWorkspaceMember(params.workspaceId, params.createdBy))) {
     throw new NotAuthorizedError("You must be a member of this workspace to create a project in it.");
+  }
+
+  if (params.clientId) {
+    const client = await db.query.clients.findFirst({ where: eq(clients.id, params.clientId) });
+    if (!client || client.workspaceId !== params.workspaceId) {
+      throw new NotFoundError("Client not found in this workspace.");
+    }
   }
 
   return db.transaction(async (tx) => {
@@ -45,6 +53,7 @@ export async function createProject(params: {
         description: params.description,
         visibility: params.visibility ?? "PRIVATE_TO_MEMBERS",
         createdBy: params.createdBy,
+        clientId: params.clientId ?? null,
       })
       .returning();
 
@@ -80,6 +89,7 @@ export async function listProjectsForWorkspace(workspaceId: string, requestingUs
   const allProjects = await db.query.projects.findMany({
     where: and(eq(projects.workspaceId, workspaceId), isNull(projects.archivedAt)),
     orderBy: (p, { desc }) => [desc(p.createdAt)],
+    with: { client: { columns: { id: true, name: true } } },
   });
 
   const isSuper = await isSuperAdmin(requestingUserId);
@@ -120,6 +130,7 @@ export async function updateProject(params: {
   name?: string;
   description?: string;
   visibility?: ProjectVisibility;
+  clientId?: string | null;
 }) {
   const project = await db.query.projects.findFirst({ where: eq(projects.id, params.projectId) });
   if (!project) throw new NotFoundError("Project not found.");
@@ -144,6 +155,7 @@ export async function updateProject(params: {
       ...(params.name !== undefined ? { name: params.name.trim() } : {}),
       ...(params.description !== undefined ? { description: params.description } : {}),
       ...(params.visibility !== undefined ? { visibility: params.visibility } : {}),
+      ...(params.clientId !== undefined ? { clientId: params.clientId } : {}),
       updatedAt: new Date(),
     })
     .where(eq(projects.id, params.projectId))

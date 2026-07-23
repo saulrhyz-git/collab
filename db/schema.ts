@@ -150,12 +150,40 @@ export const workspaceMembers = pgTable("workspace_members", {
 }));
 
 // ---------------------------------------------------------------------------
+// clients — a workspace's roster of external parties (customers, matters,
+// retainers). Exists so professional-services use cases (legal, consulting,
+// agency work) can treat "the client" as a first-class thing with its own
+// contact info and a running history of engagements, rather than just a
+// free-text label on a project. A project's client is optional — plenty of
+// projects (internal ops, a solo freelancer's own product) have no client.
+// ---------------------------------------------------------------------------
+
+export const clients = pgTable("clients", {
+  id: uuid("id").primaryKey().defaultRandom(),
+  workspaceId: uuid("workspace_id").notNull().references(() => workspaces.id, { onDelete: "cascade" }),
+  name: varchar("name", { length: 200 }).notNull(),
+  primaryContactName: varchar("primary_contact_name", { length: 200 }),
+  primaryContactEmail: varchar("primary_contact_email", { length: 320 }),
+  notes: text("notes"),
+  createdBy: uuid("created_by").notNull().references(() => users.id),
+  archivedAt: timestamp("archived_at", { withTimezone: true }),
+  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+  updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
+}, (t) => ({
+  workspaceIdx: index("clients_workspace_idx").on(t.workspaceId),
+}));
+
+// ---------------------------------------------------------------------------
 // projects
 // ---------------------------------------------------------------------------
 
 export const projects = pgTable("projects", {
   id: uuid("id").primaryKey().defaultRandom(),
   workspaceId: uuid("workspace_id").notNull().references(() => workspaces.id, { onDelete: "cascade" }),
+  // Nullable — a project is a "client engagement" when this is set (the
+  // legal/consultancy framing the dashboard leans into), but plenty of
+  // projects (internal ops, a solo freelancer's own product) have no client.
+  clientId: uuid("client_id").references(() => clients.id, { onDelete: "set null" }),
   name: varchar("name", { length: 200 }).notNull(),
   description: text("description"),
   visibility: projectVisibilityEnum("visibility").notNull().default("PRIVATE_TO_MEMBERS"),
@@ -166,6 +194,7 @@ export const projects = pgTable("projects", {
 }, (t) => ({
   workspaceIdx: index("projects_workspace_idx").on(t.workspaceId),
   workspaceVisibilityIdx: index("projects_workspace_visibility_idx").on(t.workspaceId, t.visibility),
+  clientIdx: index("projects_client_idx").on(t.clientId),
 }));
 
 // ---------------------------------------------------------------------------
@@ -319,8 +348,15 @@ export const workspaceMembersRelations = relations(workspaceMembers, ({ one }) =
   user: one(users, { fields: [workspaceMembers.userId], references: [users.id] }),
 }));
 
+export const clientsRelations = relations(clients, ({ one, many }) => ({
+  workspace: one(workspaces, { fields: [clients.workspaceId], references: [workspaces.id] }),
+  createdByUser: one(users, { fields: [clients.createdBy], references: [users.id] }),
+  projects: many(projects),
+}));
+
 export const projectsRelations = relations(projects, ({ one, many }) => ({
   workspace: one(workspaces, { fields: [projects.workspaceId], references: [workspaces.id] }),
+  client: one(clients, { fields: [projects.clientId], references: [clients.id] }),
   members: many(projectMembers),
   tasks: many(tasks),
   invitations: many(projectInvitations),
@@ -378,6 +414,7 @@ export const activityLogsRelations = relations(activityLogs, ({ one }) => ({
 export type User = typeof users.$inferSelect;
 export type Workspace = typeof workspaces.$inferSelect;
 export type WorkspaceMember = typeof workspaceMembers.$inferSelect;
+export type Client = typeof clients.$inferSelect;
 export type Project = typeof projects.$inferSelect;
 export type ProjectMember = typeof projectMembers.$inferSelect;
 export type ProjectInvitation = typeof projectInvitations.$inferSelect;

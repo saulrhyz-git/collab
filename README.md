@@ -54,6 +54,17 @@ Requirements: Node 20+, Docker (for local Postgres) or your own Postgres 16 inst
 
    This creates (or promotes, if it already exists) the account and flips `is_super_admin` on it. A super admin bypasses workspace/project membership checks everywhere — every workspace shows up in their switcher, they can manage any project's members and tasks, and RLS independently enforces the same bypass at the database level (see `auth/super-admin.ts` and the `is_super_admin()` function in `db/rls-policies.sql`). It's a genuine platform-wide override, not scoped to any one workspace — treat the password like the keys to everything.
 
+### Updating an already-running install
+
+If you already had this app running before the clients/dashboard feature landed, the new `clients` table and `projects.client_id` column need to be added to your existing database — pull the code, then re-run steps 4 and 5:
+
+```bash
+npm run db:push
+psql "$DATABASE_URL" -f db/rls-policies.sql
+```
+
+`db:push` only adds what's new (it won't touch your existing rows), and `rls-policies.sql` is idempotent (`CREATE OR REPLACE FUNCTION`, `CREATE POLICY` guarded by the policies being dropped/recreated on each run) — safe to re-run any time the schema or policies change. Restart `npm run dev` afterward.
+
 ### Other useful scripts
 
 - `npm run typecheck` — `tsc --noEmit` across the whole project.
@@ -68,7 +79,19 @@ Requirements: Node 20+, Docker (for local Postgres) or your own Postgres 16 inst
 
 ## Default workspace & project management
 
-Every account gets a personal workspace on signup (see `auth/signup.ts`). Signing in lands on that workspace's dashboard (`app/dashboard-shell.tsx`): a grid of the workspace's projects, an empty state with a "New project" call to action if there are none yet, and a create-project dialog (`components/CreateProjectDialog.tsx`). A super admin sees every project across every workspace here, not just ones they're a member of.
+Every account gets a personal workspace on signup (see `auth/signup.ts`). Signing in lands on that workspace's dashboard (`app/dashboard-shell.tsx`) — a proper "what's going on" landing page, not a bare project grid: a greeting, four stat cards (active engagements, my open tasks, due this week, overdue), a "My tasks" widget and a workspace-wide "Upcoming deadlines" widget, a "Recent activity" feed, and the full client/engagement roster below. A super admin sees every project across every workspace here, not just ones they're a member of.
+
+### Clients & engagements (legal / consultancy framing)
+
+Professional-services work — legal matters, consulting engagements, agency retainers — treats "the client" as a first-class thing, not just a project label. `clients` (`db/schema.ts`) is a workspace-scoped roster: name, primary contact name/email, notes. `projects.client_id` is a nullable FK to it — a project is an "engagement" when it's set, or stays an ordinary internal project when it's left blank (solo product work, internal ops).
+
+- `services/clients.ts` — `createClient`, `listClientsForWorkspace`, `getClient` (client + its non-archived engagements, visibility-filtered same as the project list), `updateClient` (creator or workspace admin only), `archiveClient` (workspace admin only, soft delete).
+- Creating a project (`components/CreateProjectDialog.tsx`) lets you pick an existing client, add a new one inline without leaving the dialog, or leave it as "No client — internal project."
+- `components/CreateClientDialog.tsx` lets you log a client relationship on its own — matters/accounts often get opened before the first task does.
+- `app/clients/[clientId]/` — a client detail page: contact info, notes, and every engagement on record for them, with a "New engagement" button that preselects that client.
+- On the dashboard, engagements are grouped by client (linking to the client detail page), with an "Internal / no client" bucket for everything else. Each engagement card shows a task-completion progress bar and an overdue count.
+
+New routes: `GET/POST /api/workspaces/[workspaceId]/clients`, `GET/PATCH/DELETE /api/clients/[clientId]`, `GET /api/workspaces/[workspaceId]/dashboard` (the aggregate endpoint the landing page reads in one call — stats, my tasks, upcoming deadlines, recent activity, and the clients/engagements rollup; see `services/dashboard.ts`).
 
 Opening a project goes to `app/projects/[projectId]/page.tsx` → `project-shell.tsx`, which switches between three views of the same task data via tabs:
 
@@ -90,25 +113,29 @@ Out of scope for this pass, deliberately: automations/rules, custom fields, and 
 
 ## File map
 
-- `db/schema.ts` — Drizzle schema: workspaces, projects, tasks (+ subtasks + dependencies + comments), memberships, invitations, activity log.
+- `db/schema.ts` — Drizzle schema: workspaces, clients, projects, tasks (+ subtasks + dependencies + comments), memberships, invitations, activity log.
 - `db/rls-policies.sql` — RLS enablement + policies, run after the Drizzle migration. Includes the `is_super_admin()` bypass baked into every membership-check function.
 - `db/client.ts` — Postgres pool, Drizzle instance, and the `AsyncLocalStorage`-based `runWithRlsContext` wrapper that sets the `app.current_user_id` / `app.current_workspace_id` session GUCs every RLS policy reads, transparently, for every query issued through `db` during a request. `db/with-rls-context.ts` re-exports the same function for backwards compatibility.
 - `auth/signup.ts` — signup + automatic personal workspace provisioning.
 - `auth/auth.config.ts`, `auth/index.ts` — NextAuth v5 credentials provider, JWT callbacks.
 - `auth/workspace-context.middleware.ts` — resolves and **verifies** the active workspace on every request; also where the super-admin bypass short-circuits the membership lookup.
 - `auth/super-admin.ts` — `isSuperAdmin(userId)` check used by the middleware, services, and the realtime server.
+- `services/clients.ts` — `createClient`, `listClientsForWorkspace`, `getClient`, `updateClient`, `archiveClient`.
 - `services/projects.ts` — `createProject`, `listProjectsForWorkspace` (super admin sees all), `getProject`, `updateProject`, `archiveProject`.
 - `services/tasks.ts` — CRUD plus `getTaskDetail` (task + assignee + reporter + subtasks + dependency edges in one call).
 - `services/task-dependencies.ts` — add/remove dependency, cycle detection.
 - `services/task-comments.ts` — list/add/delete comments.
+- `services/dashboard.ts` — `getWorkspaceDashboard`, the landing page's single aggregate query.
 - `services/invitations.ts` — `sendProjectInvite`, `acceptProjectInvite`, `revokeProjectInvite`.
 - `services/workspace-members.ts` — `removeWorkspaceMember`, with task-reassignment handling.
 - `services/notifications.ts` — email/in-app adapters.
 - `scripts/seed-superadmin.ts` — creates/promotes the super admin account from `.env`.
 - `app/api/**/route.ts` — Next.js route handlers wiring the above into HTTP.
-- `app/dashboard-shell.tsx` — workspace project list + create-project dialog.
+- `app/dashboard-shell.tsx` — the post-login landing page: stats, my tasks, upcoming deadlines, recent activity, clients/engagements roster.
 - `app/projects/[projectId]/` — project detail page and the Board/List/Gantt tab shell.
-- `components/*.tsx` — WorkspaceSelector, ProjectCollaboratorModal, KanbanBoard, TaskListView, GanttChart, TaskDetailPanel, CreateProjectDialog, plus the shadcn/ui primitives under `components/ui/`.
+- `app/clients/[clientId]/` — client detail page (contact info, notes, engagements).
+- `lib/format-activity.ts` — turns an activity-log row into a human sentence for the recent-activity feed.
+- `components/*.tsx` — WorkspaceSelector, ProjectCollaboratorModal, KanbanBoard, TaskListView, GanttChart, TaskDetailPanel, CreateProjectDialog, CreateClientDialog, plus the shadcn/ui primitives under `components/ui/`.
 - `realtime/socket-server.ts` — Socket.io server with room-based project isolation.
 
 ## Step 5: Security & edge cases
