@@ -1,8 +1,37 @@
 /**
- * Thin notification adapters. Swap implementations (Resend/SES for email,
- * a notifications table + WebSocket push for in-app) without touching
- * invitations.ts.
+ * Thin notification adapters. Email now goes through whatever SMTP server
+ * a super admin has configured at /admin/smtp-settings (see
+ * services/smtp-settings.ts) via nodemailer; if nothing's configured yet
+ * (fresh install, local dev), it falls back to logging the link to the
+ * console so the flow is still testable without setting up a mail server.
  */
+
+import nodemailer from "nodemailer";
+import { getSmtpSettingsForSending } from "./smtp-settings";
+
+async function sendEmail(params: { to: string; subject: string; text: string; html?: string }) {
+  const smtp = await getSmtpSettingsForSending();
+
+  if (!smtp) {
+    console.info(`[email:dev-mode, no SMTP configured] to=${params.to} subject="${params.subject}"\n${params.text}`);
+    return;
+  }
+
+  const transporter = nodemailer.createTransport({
+    host: smtp.host,
+    port: smtp.port,
+    secure: smtp.secure,
+    auth: smtp.username ? { user: smtp.username, pass: smtp.password } : undefined,
+  });
+
+  await transporter.sendMail({
+    from: smtp.fromName ? `"${smtp.fromName}" <${smtp.fromAddress}>` : smtp.fromAddress,
+    to: params.to,
+    subject: params.subject,
+    text: params.text,
+    html: params.html,
+  });
+}
 
 export async function sendInviteEmail(params: {
   to: string;
@@ -14,8 +43,12 @@ export async function sendInviteEmail(params: {
   url.searchParams.set("token", params.rawToken);
   if (!params.isExistingUser) url.searchParams.set("signup", "1");
 
-  // Replace with real email provider (Resend, SES, Postmark...).
-  console.info(`[email] invite -> ${params.to}: ${url.toString()}`);
+  await sendEmail({
+    to: params.to,
+    subject: "You've been invited to an engagement",
+    text: `You've been invited to collaborate on an engagement. Accept here: ${url.toString()}`,
+    html: `<p>You've been invited to collaborate on an engagement.</p><p><a href="${url.toString()}">Accept the invitation</a></p>`,
+  });
 }
 
 export async function sendInAppNotification(params: {

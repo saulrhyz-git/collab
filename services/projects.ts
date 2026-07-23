@@ -3,6 +3,7 @@ import { eq, and, isNull } from "drizzle-orm";
 import { db } from "../db/client";
 import { projects, projectMembers, workspaceMembers, activityLogs, clients } from "../db/schema";
 import { isSuperAdmin } from "../auth/super-admin";
+import { userHasWorkspacePermission, userHasProjectPermission } from "./permissions";
 
 export class NotAuthorizedError extends Error {}
 export class NotFoundError extends Error {}
@@ -15,6 +16,15 @@ async function isWorkspaceMember(workspaceId: string, userId: string) {
     where: and(eq(workspaceMembers.workspaceId, workspaceId), eq(workspaceMembers.userId, userId)),
   });
   return !!m;
+}
+
+/** Structural bypass mirroring RLS's is_workspace_admin() — OWNER/ADMIN role or super admin, NOT matrix-governed. */
+async function isWorkspaceAdminRole(workspaceId: string, userId: string) {
+  if (await isSuperAdmin(userId)) return true;
+  const m = await db.query.workspaceMembers.findFirst({
+    where: and(eq(workspaceMembers.workspaceId, workspaceId), eq(workspaceMembers.userId, userId)),
+  });
+  return m?.role === "OWNER" || m?.role === "ADMIN";
 }
 
 /**
@@ -45,7 +55,10 @@ export async function createProject(params: {
   const name = params.name.trim();
   if (!name) throw new Error("Project name is required.");
 
-  if (!(await isWorkspaceMember(params.workspaceId, params.createdBy))) {
+  const creatorRole = await db.query.workspaceMembers.findFirst({
+    where: and(eq(workspaceMembers.workspaceId, params.workspaceId), eq(workspaceMembers.userId, params.createdBy)),
+  });
+  if (!(await userHasWorkspacePermission(creatorRole?.role, params.createdBy, "project.create"))) {
     throw new NotAuthorizedError("You must be a member of this workspace to create a project in it.");
   }
 
@@ -147,17 +160,28 @@ export async function updateProject(params: {
   const project = await db.query.projects.findFirst({ where: eq(projects.id, params.projectId) });
   if (!project) throw new NotFoundError("Project not found.");
 
-  const isSuper = await isSuperAdmin(params.actingUserId);
-  if (!isSuper) {
-    const membership = await db.query.projectMembers.findFirst({
-      where: and(eq(projectMembers.projectId, params.projectId), eq(projectMembers.userId, params.actingUserId)),
-    });
+  // Mirrors projects_update RLS exactly: is_workspace_admin(workspace_id) OR
+  // has_workspace_permission(workspace_id, 'project.manage') OR
+  // has_project_permission(id, 'project.edit'). The first is a structural
+  // bypass; the latter two are matrix-governed (services/permissions.ts).
+  const isWorkspaceAdmin = await isWorkspaceAdminRole(project.workspaceId, params.actingUserId);
+  if (!isWorkspaceAdmin) {
     const workspaceMembership = await db.query.workspaceMembers.findFirst({
       where: and(eq(workspaceMembers.workspaceId, project.workspaceId), eq(workspaceMembers.userId, params.actingUserId)),
     });
-    const isWorkspaceAdmin = workspaceMembership?.role === "OWNER" || workspaceMembership?.role === "ADMIN";
-    if (membership?.role !== "PROJECT_ADMIN" && !isWorkspaceAdmin) {
-      throw new NotAuthorizedError("Only a project admin or workspace admin can edit this project.");
+    const canManageWorkspaceProjects = await userHasWorkspacePermission(
+      workspaceMembership?.role,
+      params.actingUserId,
+      "project.manage"
+    );
+    if (!canManageWorkspaceProjects) {
+      const membership = await db.query.projectMembers.findFirst({
+        where: and(eq(projectMembers.projectId, params.projectId), eq(projectMembers.userId, params.actingUserId)),
+      });
+      const canEditProject = await userHasProjectPermission(membership?.role, params.actingUserId, "project.edit");
+      if (!canEditProject) {
+        throw new NotAuthorizedError("Only a project admin or workspace admin can edit this project.");
+      }
     }
   }
 
@@ -181,12 +205,14 @@ export async function archiveProject(projectId: string, actingUserId: string) {
   const project = await db.query.projects.findFirst({ where: eq(projects.id, projectId) });
   if (!project) throw new NotFoundError("Project not found.");
 
-  if (!(await isSuperAdmin(actingUserId))) {
+  // Mirrors projects_delete RLS: is_workspace_admin(workspace_id) OR
+  // has_workspace_permission(workspace_id, 'project.manage').
+  if (!(await isWorkspaceAdminRole(project.workspaceId, actingUserId))) {
     const workspaceMembership = await db.query.workspaceMembers.findFirst({
       where: and(eq(workspaceMembers.workspaceId, project.workspaceId), eq(workspaceMembers.userId, actingUserId)),
     });
-    const isWorkspaceAdmin = workspaceMembership?.role === "OWNER" || workspaceMembership?.role === "ADMIN";
-    if (!isWorkspaceAdmin) {
+    const canManage = await userHasWorkspacePermission(workspaceMembership?.role, actingUserId, "project.manage");
+    if (!canManage) {
       throw new NotAuthorizedError("Only a workspace admin can archive a project.");
     }
   }

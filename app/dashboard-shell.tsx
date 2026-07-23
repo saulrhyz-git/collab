@@ -15,6 +15,7 @@ import {
   AlertTriangle,
   Clock,
   Building2,
+  ShieldCheck,
 } from "lucide-react";
 import WorkspaceSelector from "@/components/WorkspaceSelector";
 import CreateProjectDialog from "@/components/CreateProjectDialog";
@@ -23,6 +24,12 @@ import { Button } from "@/components/ui/button";
 import { Card, CardContent } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
 import { Avatar, AvatarFallback, AvatarImage } from "@/components/ui/avatar";
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuTrigger,
+} from "@/components/ui/dropdown-menu";
 import { cn, formatRelativeTime, formatDueLabel } from "@/lib/utils";
 import { formatActivity } from "@/lib/format-activity";
 
@@ -122,9 +129,11 @@ function getGreeting(): string {
 export default function DashboardShell({
   activeWorkspaceId,
   userName,
+  isSuperAdmin,
 }: {
   activeWorkspaceId: string;
   userName: string;
+  isSuperAdmin?: boolean;
 }) {
   const [createProjectOpen, setCreateProjectOpen] = useState(false);
   const [createClientOpen, setCreateClientOpen] = useState(false);
@@ -147,9 +156,36 @@ export default function DashboardShell({
 
   return (
     <div className="flex min-h-screen flex-col bg-muted/20">
-      <header className="flex items-center justify-between border-b bg-background px-6 py-3">
+      <header className="flex items-center justify-between border-b-2 border-b-gold bg-background px-6 py-3">
         <WorkspaceSelector activeWorkspaceId={activeWorkspaceId} />
         <div className="flex items-center gap-3">
+          {isSuperAdmin && (
+            <DropdownMenu>
+              <DropdownMenuTrigger asChild>
+                <Button variant="outline" size="sm">
+                  <ShieldCheck className="mr-1.5 h-4 w-4 text-gold" />
+                  Admin
+                </Button>
+              </DropdownMenuTrigger>
+              <DropdownMenuContent align="end">
+                <DropdownMenuItem asChild>
+                  <Link href="/admin/permissions">Permissions matrix</Link>
+                </DropdownMenuItem>
+                <DropdownMenuItem asChild>
+                  <Link href="/admin/task-templates">Task templates</Link>
+                </DropdownMenuItem>
+                <DropdownMenuItem asChild>
+                  <Link href="/admin/engagement-types">Engagement types</Link>
+                </DropdownMenuItem>
+                <DropdownMenuItem asChild>
+                  <Link href="/admin/smtp-settings">SMTP settings</Link>
+                </DropdownMenuItem>
+                <DropdownMenuItem asChild>
+                  <Link href="/admin/ai-provider-settings">AI provider settings</Link>
+                </DropdownMenuItem>
+              </DropdownMenuContent>
+            </DropdownMenu>
+          )}
           <span className="text-sm text-muted-foreground">{userName}</span>
           <Button variant="outline" size="sm" onClick={() => signOut({ callbackUrl: "/login" })}>
             Sign out

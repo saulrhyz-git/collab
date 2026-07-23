@@ -57,7 +57,7 @@ export async function addDependency(params: {
   }
 
   const role = await requireProjectAccess(successor.projectId, successor.workspaceId, params.actingUserId);
-  if (!canWrite(role)) throw new NotAuthorizedError("Viewers cannot add dependencies.");
+  if (!(await canWrite(role, params.actingUserId))) throw new NotAuthorizedError("Viewers cannot add dependencies.");
 
   if (await wouldCreateCycle(successor.projectId, params.predecessorTaskId, params.successorTaskId)) {
     throw new CyclicDependencyError("This would create a circular dependency.");
@@ -84,7 +84,7 @@ export async function removeDependency(params: { dependencyId: string; actingUse
   if (!successor) throw new NotFoundError("Task not found.");
 
   const role = await requireProjectAccess(successor.projectId, successor.workspaceId, params.actingUserId);
-  if (!canWrite(role)) throw new NotAuthorizedError("Viewers cannot remove dependencies.");
+  if (!(await canWrite(role, params.actingUserId))) throw new NotAuthorizedError("Viewers cannot remove dependencies.");
 
   await db.delete(taskDependencies).where(eq(taskDependencies.id, params.dependencyId));
 }

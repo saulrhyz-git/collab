@@ -50,6 +50,11 @@ export function mapDomainError(err: unknown): NextResponse | null {
     case "CannotRemoveLastAdminError":
     case "CyclicDependencyError":
       return NextResponse.json({ error: (err as Error).message || "Conflict" }, { status: 409 });
+    case "UnsupportedDocumentTypeError":
+    case "AiNotConfiguredError":
+      return NextResponse.json({ error: (err as Error).message || "Bad request" }, { status: 400 });
+    case "AiReviewFailedError":
+      return NextResponse.json({ error: (err as Error).message || "AI review failed" }, { status: 502 });
     default:
       return null;
   }

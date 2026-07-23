@@ -1,5 +1,6 @@
 import { redirect } from "next/navigation";
 import { auth } from "../auth";
+import { isSuperAdmin } from "../auth/super-admin";
 import { resolveRequestContext } from "../auth/workspace-context.middleware";
 import DashboardShell from "./dashboard-shell";
 import { headers, cookies } from "next/headers";
@@ -8,6 +9,8 @@ import { NextRequest } from "next/server";
 export default async function HomePage() {
   const session = await auth();
   if (!session?.user?.id) redirect("/login");
+
+  const isAdmin = await isSuperAdmin(session.user.id);
 
   // Reuse the same context-resolution logic the API routes use, so the
   // server-rendered shell and every client fetch agree on which workspace
@@ -21,5 +24,11 @@ export default async function HomePage() {
 
   const ctx = await resolveRequestContext(pseudoRequest);
 
-  return <DashboardShell activeWorkspaceId={ctx.activeWorkspaceId} userName={session.user.name ?? ""} />;
+  return (
+    <DashboardShell
+      activeWorkspaceId={ctx.activeWorkspaceId}
+      userName={session.user.name ?? ""}
+      isSuperAdmin={isAdmin}
+    />
+  );
 }

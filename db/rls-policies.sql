@@ -91,7 +91,7 @@ $$;
 -- SECURITY DEFINER function below fails with "permission denied for table
 -- ..." the moment it runs, since rls_helper otherwise has zero privileges
 -- on these tables (only their owner and superusers get that implicitly).
-GRANT SELECT ON workspaces, workspace_members, projects, project_members, project_invitations, users
+GRANT SELECT ON workspaces, workspace_members, projects, project_members, project_invitations, users, role_permissions
   TO rls_helper;
 
 -- Is the current user a member of the given workspace (any role)?
@@ -196,6 +196,59 @@ $$ LANGUAGE sql STABLE SECURITY DEFINER SET search_path = public;
 ALTER FUNCTION has_pending_project_invite(uuid) OWNER TO rls_helper;
 
 -- ---------------------------------------------------------------------------
+-- RBAC permissions matrix helpers.
+--
+-- has_permission() is the raw lookup against role_permissions — safe as a
+-- plain (non-bypass) function since that table isn't self-referential
+-- (doesn't touch workspace_members/project_members), so no recursion risk.
+-- has_workspace_permission()/has_project_permission() layer the actual
+-- membership lookup on top and DO need the bypass treatment, for the same
+-- reason is_workspace_admin()/is_project_member() do above.
+--
+-- can_perform_on_project() generalizes can_access_project(): a workspace
+-- member with no explicit project_members row on a PUBLIC_TO_WORKSPACE
+-- project is treated as VIEWER-equivalent for permission purposes (matching
+-- can_access_project's existing visibility rule), so the matrix's VIEWER
+-- grant governs what they can do there too, rather than an unconditional
+-- allow. Used anywhere a *specific* permission key gates an action on task/
+-- comment/file rows that hang off a project, as opposed to plain visibility.
+-- ---------------------------------------------------------------------------
+
+CREATE OR REPLACE FUNCTION has_permission(p_scope text, p_role text, p_key text) RETURNS boolean AS $$
+  SELECT COALESCE(
+    (SELECT rp.granted FROM role_permissions rp
+     WHERE rp.scope::text = p_scope AND rp.role = p_role AND rp.permission_key = p_key),
+    false
+  );
+$$ LANGUAGE sql STABLE;
+
+CREATE OR REPLACE FUNCTION has_workspace_permission(ws_id uuid, p_key text) RETURNS boolean AS $$
+  SELECT is_super_admin() OR EXISTS (
+    SELECT 1 FROM workspace_members wm
+    WHERE wm.workspace_id = ws_id
+      AND wm.user_id = current_app_user_id()
+      AND has_permission('WORKSPACE', wm.role::text, p_key)
+  );
+$$ LANGUAGE sql STABLE SECURITY DEFINER SET search_path = public;
+ALTER FUNCTION has_workspace_permission(uuid, text) OWNER TO rls_helper;
+
+CREATE OR REPLACE FUNCTION has_project_permission(p_id uuid, p_key text) RETURNS boolean AS $$
+  SELECT is_super_admin() OR EXISTS (
+    SELECT 1 FROM project_members pm
+    WHERE pm.project_id = p_id
+      AND pm.user_id = current_app_user_id()
+      AND has_permission('PROJECT', pm.role::text, p_key)
+  );
+$$ LANGUAGE sql STABLE SECURITY DEFINER SET search_path = public;
+ALTER FUNCTION has_project_permission(uuid, text) OWNER TO rls_helper;
+
+CREATE OR REPLACE FUNCTION can_perform_on_project(p_id uuid, ws_id uuid, visibility project_visibility, p_key text) RETURNS boolean AS $$
+  SELECT
+    (visibility = 'PUBLIC_TO_WORKSPACE' AND is_workspace_member(ws_id) AND has_permission('PROJECT', 'VIEWER', p_key))
+    OR has_project_permission(p_id, p_key);
+$$ LANGUAGE sql STABLE;
+
+-- ---------------------------------------------------------------------------
 -- workspaces
 -- ---------------------------------------------------------------------------
 ALTER TABLE workspaces ENABLE ROW LEVEL SECURITY;
@@ -263,12 +316,13 @@ CREATE POLICY workspace_members_insert ON workspace_members
 
 DROP POLICY IF EXISTS workspace_members_update ON workspace_members;
 CREATE POLICY workspace_members_update ON workspace_members
-  FOR UPDATE USING (is_workspace_admin(workspace_id));
+  FOR UPDATE USING (is_workspace_admin(workspace_id) OR has_workspace_permission(workspace_id, 'workspace.manage_members'));
 
 DROP POLICY IF EXISTS workspace_members_delete ON workspace_members;
 CREATE POLICY workspace_members_delete ON workspace_members
   FOR DELETE USING (
     is_workspace_admin(workspace_id)
+    OR has_workspace_permission(workspace_id, 'workspace.manage_members')
     OR user_id = current_app_user_id() -- self-removal ("leave workspace")
   );
 
@@ -289,17 +343,23 @@ DROP POLICY IF EXISTS clients_select ON clients;
 CREATE POLICY clients_select ON clients
   FOR SELECT USING (is_workspace_member(workspace_id));
 
+-- client.create / client.manage are matrix-governed (see role_permissions);
+-- workspace admin and self-created-it stay as structural bypasses on top.
 DROP POLICY IF EXISTS clients_insert ON clients;
 CREATE POLICY clients_insert ON clients
-  FOR INSERT WITH CHECK (is_workspace_member(workspace_id) AND created_by = current_app_user_id());
+  FOR INSERT WITH CHECK (has_workspace_permission(workspace_id, 'client.create') AND created_by = current_app_user_id());
 
 DROP POLICY IF EXISTS clients_update ON clients;
 CREATE POLICY clients_update ON clients
-  FOR UPDATE USING (is_workspace_admin(workspace_id) OR created_by = current_app_user_id());
+  FOR UPDATE USING (
+    is_workspace_admin(workspace_id)
+    OR created_by = current_app_user_id()
+    OR has_workspace_permission(workspace_id, 'client.manage')
+  );
 
 DROP POLICY IF EXISTS clients_delete ON clients;
 CREATE POLICY clients_delete ON clients
-  FOR DELETE USING (is_workspace_admin(workspace_id));
+  FOR DELETE USING (is_workspace_admin(workspace_id) OR has_workspace_permission(workspace_id, 'client.manage'));
 
 -- ---------------------------------------------------------------------------
 -- projects
@@ -313,21 +373,19 @@ CREATE POLICY projects_select ON projects
 
 DROP POLICY IF EXISTS projects_insert ON projects;
 CREATE POLICY projects_insert ON projects
-  FOR INSERT WITH CHECK (is_workspace_member(workspace_id));
+  FOR INSERT WITH CHECK (has_workspace_permission(workspace_id, 'project.create'));
 
 DROP POLICY IF EXISTS projects_update ON projects;
 CREATE POLICY projects_update ON projects
   FOR UPDATE USING (
     is_workspace_admin(workspace_id)
-    OR EXISTS (
-      SELECT 1 FROM project_members pm
-      WHERE pm.project_id = id AND pm.user_id = current_app_user_id() AND pm.role = 'PROJECT_ADMIN'
-    )
+    OR has_workspace_permission(workspace_id, 'project.manage')
+    OR has_project_permission(id, 'project.edit')
   );
 
 DROP POLICY IF EXISTS projects_delete ON projects;
 CREATE POLICY projects_delete ON projects
-  FOR DELETE USING (is_workspace_admin(workspace_id));
+  FOR DELETE USING (is_workspace_admin(workspace_id) OR has_workspace_permission(workspace_id, 'project.manage'));
 
 -- ---------------------------------------------------------------------------
 -- project_members
@@ -354,10 +412,9 @@ DROP POLICY IF EXISTS project_members_insert ON project_members;
 CREATE POLICY project_members_insert ON project_members
   FOR INSERT WITH CHECK (
     is_workspace_admin(project_workspace_id(project_id))
-    OR EXISTS (
-      SELECT 1 FROM project_members pm2
-      WHERE pm2.project_id = project_id AND pm2.user_id = current_app_user_id() AND pm2.role = 'PROJECT_ADMIN'
-    )
+    -- Matrix-governed: whoever holds 'project.manage_members' (PROJECT_ADMIN
+    -- by default) can add members — replaces the old hardcoded role check.
+    OR has_project_permission(project_id, 'project.manage_members')
     -- Bootstrap: the project's own creator may insert their first
     -- (PROJECT_ADMIN) membership row immediately after creating it — same
     -- shape as workspace_members_insert's OWNER bootstrap branch, and
@@ -386,6 +443,7 @@ CREATE POLICY project_members_delete ON project_members
   FOR DELETE USING (
     user_id = current_app_user_id() -- self-removal
     OR is_workspace_admin(project_workspace_id(project_id))
+    OR has_project_permission(project_id, 'project.manage_members')
   );
 
 -- ---------------------------------------------------------------------------
@@ -439,13 +497,13 @@ CREATE POLICY tasks_select ON tasks
 DROP POLICY IF EXISTS tasks_write ON tasks;
 CREATE POLICY tasks_write ON tasks
   FOR ALL USING (
-    EXISTS (
-      SELECT 1 FROM project_members pm
-      WHERE pm.project_id = project_id
-        AND pm.user_id = current_app_user_id()
-        AND pm.role IN ('PROJECT_ADMIN', 'EDITOR')
+    is_workspace_admin(workspace_id)
+    OR can_perform_on_project(
+      project_id,
+      workspace_id,
+      (SELECT p.visibility FROM projects p WHERE p.id = project_id),
+      'task.write'
     )
-    OR is_workspace_admin(workspace_id)
   );
 
 -- ---------------------------------------------------------------------------
@@ -472,13 +530,9 @@ CREATE POLICY task_dependencies_write ON task_dependencies
   FOR ALL USING (
     EXISTS (
       SELECT 1 FROM tasks t
-      JOIN project_members pm ON pm.project_id = t.project_id
+      JOIN projects p ON p.id = t.project_id
       WHERE t.id = successor_task_id
-        AND pm.user_id = current_app_user_id()
-        AND pm.role IN ('PROJECT_ADMIN', 'EDITOR')
-    )
-    OR EXISTS (
-      SELECT 1 FROM tasks t WHERE t.id = successor_task_id AND is_workspace_admin(t.workspace_id)
+        AND (is_workspace_admin(t.workspace_id) OR can_perform_on_project(p.id, p.workspace_id, p.visibility, 'task.write'))
     )
   );
 
@@ -508,7 +562,7 @@ CREATE POLICY task_comments_insert ON task_comments
     AND EXISTS (
       SELECT 1 FROM tasks t
       JOIN projects p ON p.id = t.project_id
-      WHERE t.id = task_id AND can_access_project(p.id, p.workspace_id, p.visibility)
+      WHERE t.id = task_id AND can_perform_on_project(p.id, p.workspace_id, p.visibility, 'task.comment')
     )
   );
 
@@ -535,3 +589,241 @@ CREATE POLICY activity_logs_insert ON activity_logs
 
 -- No UPDATE/DELETE policy is created for activity_logs -> table is
 -- effectively immutable to the application role (audit integrity).
+
+-- ---------------------------------------------------------------------------
+-- permissions / role_permissions — the RBAC matrix. `permissions` is a fixed
+-- catalog (seeded below, not user-editable); `role_permissions` is the
+-- actual tickbox grid, editable only by a super admin. Both are readable by
+-- any authenticated user because ordinary requests (via has_permission() and
+-- friends above) need to read grants to authorize themselves — restricting
+-- SELECT to super admins would break every permission check for everyone else.
+-- ---------------------------------------------------------------------------
+ALTER TABLE permissions ENABLE ROW LEVEL SECURITY;
+ALTER TABLE permissions FORCE ROW LEVEL SECURITY;
+
+DROP POLICY IF EXISTS permissions_select ON permissions;
+CREATE POLICY permissions_select ON permissions
+  FOR SELECT USING (current_app_user_id() IS NOT NULL);
+
+-- No insert/update/delete policy — the catalog is developer-maintained via
+-- the seed block below, not editable through the app at all (including by
+-- super admins), so its keys can't drift out from under the code that
+-- references them by name.
+
+ALTER TABLE role_permissions ENABLE ROW LEVEL SECURITY;
+ALTER TABLE role_permissions FORCE ROW LEVEL SECURITY;
+
+DROP POLICY IF EXISTS role_permissions_select ON role_permissions;
+CREATE POLICY role_permissions_select ON role_permissions
+  FOR SELECT USING (current_app_user_id() IS NOT NULL);
+
+DROP POLICY IF EXISTS role_permissions_write ON role_permissions;
+CREATE POLICY role_permissions_write ON role_permissions
+  FOR ALL USING (is_super_admin()) WITH CHECK (is_super_admin());
+
+-- Permission catalog. ON CONFLICT DO NOTHING keeps this re-runnable without
+-- clobbering rows a future migration might add columns to.
+INSERT INTO permissions (key, label, scope, description) VALUES
+  ('client.create', 'Create clients', 'WORKSPACE', 'Add a new client to the workspace.'),
+  ('client.manage', 'Manage any client', 'WORKSPACE', 'Edit or archive clients you did not create yourself.'),
+  ('project.create', 'Create engagements', 'WORKSPACE', 'Create a new project/engagement in the workspace.'),
+  ('project.manage', 'Manage any engagement', 'WORKSPACE', 'Edit, archive, or delete any project in the workspace, regardless of project-level membership.'),
+  ('workspace.manage_members', 'Manage workspace members', 'WORKSPACE', 'Invite, remove, or change the role of workspace members.'),
+  ('task.write', 'Create & edit tasks', 'PROJECT', 'Create, edit, move, or delete tasks and their dependencies.'),
+  ('task.comment', 'Comment on tasks', 'PROJECT', 'Post comments on tasks.'),
+  ('project.edit', 'Edit engagement details', 'PROJECT', 'Edit this project''s name, description, visibility, and client.'),
+  ('project.manage_members', 'Manage engagement members', 'PROJECT', 'Invite, remove, or change the role of this project''s members.'),
+  ('file.upload', 'Upload reference files', 'PROJECT', 'Upload files to this engagement''s References tab.'),
+  ('file.manage', 'Manage any file', 'PROJECT', 'Delete files uploaded by other people.'),
+  ('ai_review.run', 'Run AI document review', 'PROJECT', 'Submit a document for AI-assisted review.')
+ON CONFLICT (key) DO NOTHING;
+
+-- Default grants — chosen to reproduce exactly what was hardcoded before
+-- this matrix existed, so installing it changes nothing until a super admin
+-- actually edits a tickbox.
+INSERT INTO role_permissions (scope, role, permission_key, granted) VALUES
+  ('WORKSPACE', 'OWNER',  'client.create', true),
+  ('WORKSPACE', 'ADMIN',  'client.create', true),
+  ('WORKSPACE', 'MEMBER', 'client.create', true),
+  ('WORKSPACE', 'GUEST',  'client.create', false),
+  ('WORKSPACE', 'OWNER',  'client.manage', true),
+  ('WORKSPACE', 'ADMIN',  'client.manage', true),
+  ('WORKSPACE', 'MEMBER', 'client.manage', false),
+  ('WORKSPACE', 'GUEST',  'client.manage', false),
+  ('WORKSPACE', 'OWNER',  'project.create', true),
+  ('WORKSPACE', 'ADMIN',  'project.create', true),
+  ('WORKSPACE', 'MEMBER', 'project.create', true),
+  ('WORKSPACE', 'GUEST',  'project.create', false),
+  ('WORKSPACE', 'OWNER',  'project.manage', true),
+  ('WORKSPACE', 'ADMIN',  'project.manage', true),
+  ('WORKSPACE', 'MEMBER', 'project.manage', false),
+  ('WORKSPACE', 'GUEST',  'project.manage', false),
+  ('WORKSPACE', 'OWNER',  'workspace.manage_members', true),
+  ('WORKSPACE', 'ADMIN',  'workspace.manage_members', true),
+  ('WORKSPACE', 'MEMBER', 'workspace.manage_members', false),
+  ('WORKSPACE', 'GUEST',  'workspace.manage_members', false),
+  ('PROJECT', 'PROJECT_ADMIN', 'task.write', true),
+  ('PROJECT', 'EDITOR',        'task.write', true),
+  ('PROJECT', 'VIEWER',        'task.write', false),
+  ('PROJECT', 'PROJECT_ADMIN', 'task.comment', true),
+  ('PROJECT', 'EDITOR',        'task.comment', true),
+  ('PROJECT', 'VIEWER',        'task.comment', true),
+  ('PROJECT', 'PROJECT_ADMIN', 'project.edit', true),
+  ('PROJECT', 'EDITOR',        'project.edit', false),
+  ('PROJECT', 'VIEWER',        'project.edit', false),
+  ('PROJECT', 'PROJECT_ADMIN', 'project.manage_members', true),
+  ('PROJECT', 'EDITOR',        'project.manage_members', false),
+  ('PROJECT', 'VIEWER',        'project.manage_members', false),
+  ('PROJECT', 'PROJECT_ADMIN', 'file.upload', true),
+  ('PROJECT', 'EDITOR',        'file.upload', true),
+  ('PROJECT', 'VIEWER',        'file.upload', false),
+  ('PROJECT', 'PROJECT_ADMIN', 'file.manage', true),
+  ('PROJECT', 'EDITOR',        'file.manage', false),
+  ('PROJECT', 'VIEWER',        'file.manage', false),
+  ('PROJECT', 'PROJECT_ADMIN', 'ai_review.run', true),
+  ('PROJECT', 'EDITOR',        'ai_review.run', true),
+  ('PROJECT', 'VIEWER',        'ai_review.run', false)
+ON CONFLICT (scope, role, permission_key) DO NOTHING;
+
+-- ---------------------------------------------------------------------------
+-- task_templates / task_template_items — superadmin-built, but readable by
+-- any authenticated user (the "apply a template" picker needs to list them
+-- for ordinary project creators, per the template-use permission decision).
+-- ---------------------------------------------------------------------------
+ALTER TABLE task_templates ENABLE ROW LEVEL SECURITY;
+ALTER TABLE task_templates FORCE ROW LEVEL SECURITY;
+
+DROP POLICY IF EXISTS task_templates_select ON task_templates;
+CREATE POLICY task_templates_select ON task_templates
+  FOR SELECT USING (current_app_user_id() IS NOT NULL);
+
+DROP POLICY IF EXISTS task_templates_write ON task_templates;
+CREATE POLICY task_templates_write ON task_templates
+  FOR ALL USING (is_super_admin()) WITH CHECK (is_super_admin());
+
+ALTER TABLE task_template_items ENABLE ROW LEVEL SECURITY;
+ALTER TABLE task_template_items FORCE ROW LEVEL SECURITY;
+
+DROP POLICY IF EXISTS task_template_items_select ON task_template_items;
+CREATE POLICY task_template_items_select ON task_template_items
+  FOR SELECT USING (current_app_user_id() IS NOT NULL);
+
+DROP POLICY IF EXISTS task_template_items_write ON task_template_items;
+CREATE POLICY task_template_items_write ON task_template_items
+  FOR ALL USING (is_super_admin()) WITH CHECK (is_super_admin());
+
+-- ---------------------------------------------------------------------------
+-- engagement_types / engagement_type_templates — same shape as task_templates.
+-- ---------------------------------------------------------------------------
+ALTER TABLE engagement_types ENABLE ROW LEVEL SECURITY;
+ALTER TABLE engagement_types FORCE ROW LEVEL SECURITY;
+
+DROP POLICY IF EXISTS engagement_types_select ON engagement_types;
+CREATE POLICY engagement_types_select ON engagement_types
+  FOR SELECT USING (current_app_user_id() IS NOT NULL);
+
+DROP POLICY IF EXISTS engagement_types_write ON engagement_types;
+CREATE POLICY engagement_types_write ON engagement_types
+  FOR ALL USING (is_super_admin()) WITH CHECK (is_super_admin());
+
+ALTER TABLE engagement_type_templates ENABLE ROW LEVEL SECURITY;
+ALTER TABLE engagement_type_templates FORCE ROW LEVEL SECURITY;
+
+DROP POLICY IF EXISTS engagement_type_templates_select ON engagement_type_templates;
+CREATE POLICY engagement_type_templates_select ON engagement_type_templates
+  FOR SELECT USING (current_app_user_id() IS NOT NULL);
+
+DROP POLICY IF EXISTS engagement_type_templates_write ON engagement_type_templates;
+CREATE POLICY engagement_type_templates_write ON engagement_type_templates
+  FOR ALL USING (is_super_admin()) WITH CHECK (is_super_admin());
+
+-- project_engagement_type — which engagement type (if any) a project was
+-- created from. Visibility follows the project itself; writing it is really
+-- just "creating tasks in bulk" (a template application), so it's gated the
+-- same way task.write is.
+ALTER TABLE project_engagement_type ENABLE ROW LEVEL SECURITY;
+ALTER TABLE project_engagement_type FORCE ROW LEVEL SECURITY;
+
+DROP POLICY IF EXISTS project_engagement_type_select ON project_engagement_type;
+CREATE POLICY project_engagement_type_select ON project_engagement_type
+  FOR SELECT USING (
+    EXISTS (SELECT 1 FROM projects p WHERE p.id = project_id AND can_access_project(p.id, p.workspace_id, p.visibility))
+  );
+
+DROP POLICY IF EXISTS project_engagement_type_write ON project_engagement_type;
+CREATE POLICY project_engagement_type_write ON project_engagement_type
+  FOR ALL USING (
+    EXISTS (
+      SELECT 1 FROM projects p
+      WHERE p.id = project_id
+        AND (is_workspace_admin(p.workspace_id) OR can_perform_on_project(p.id, p.workspace_id, p.visibility, 'task.write'))
+    )
+  );
+
+-- ---------------------------------------------------------------------------
+-- smtp_settings / ai_provider_settings — platform-wide singletons. SELECT is
+-- open to any authenticated user because the app itself needs to read these
+-- during normal operation on behalf of ordinary users (sending an invite
+-- email, running an AI review) — restricting reads to super admins would
+-- break those features for everyone else. The settings *page* that displays
+-- and edits these is gated at the app layer (superadmin-only route) and here
+-- via the write policy; the encrypted secret columns are never sent to the
+-- browser regardless (see services/smtp-settings.ts, services/ai-settings.ts).
+-- ---------------------------------------------------------------------------
+ALTER TABLE smtp_settings ENABLE ROW LEVEL SECURITY;
+ALTER TABLE smtp_settings FORCE ROW LEVEL SECURITY;
+
+DROP POLICY IF EXISTS smtp_settings_select ON smtp_settings;
+CREATE POLICY smtp_settings_select ON smtp_settings
+  FOR SELECT USING (current_app_user_id() IS NOT NULL);
+
+DROP POLICY IF EXISTS smtp_settings_write ON smtp_settings;
+CREATE POLICY smtp_settings_write ON smtp_settings
+  FOR ALL USING (is_super_admin()) WITH CHECK (is_super_admin());
+
+ALTER TABLE ai_provider_settings ENABLE ROW LEVEL SECURITY;
+ALTER TABLE ai_provider_settings FORCE ROW LEVEL SECURITY;
+
+DROP POLICY IF EXISTS ai_provider_settings_select ON ai_provider_settings;
+CREATE POLICY ai_provider_settings_select ON ai_provider_settings
+  FOR SELECT USING (current_app_user_id() IS NOT NULL);
+
+DROP POLICY IF EXISTS ai_provider_settings_write ON ai_provider_settings;
+CREATE POLICY ai_provider_settings_write ON ai_provider_settings
+  FOR ALL USING (is_super_admin()) WITH CHECK (is_super_admin());
+
+-- ---------------------------------------------------------------------------
+-- project_files — References tab + AI-reviewed documents. Read follows plain
+-- project visibility; upload is gated by file.upload; delete by the
+-- uploader themselves, file.manage, or workspace admin.
+-- ---------------------------------------------------------------------------
+ALTER TABLE project_files ENABLE ROW LEVEL SECURITY;
+ALTER TABLE project_files FORCE ROW LEVEL SECURITY;
+
+DROP POLICY IF EXISTS project_files_select ON project_files;
+CREATE POLICY project_files_select ON project_files
+  FOR SELECT USING (
+    EXISTS (SELECT 1 FROM projects p WHERE p.id = project_id AND can_access_project(p.id, p.workspace_id, p.visibility))
+  );
+
+DROP POLICY IF EXISTS project_files_insert ON project_files;
+CREATE POLICY project_files_insert ON project_files
+  FOR INSERT WITH CHECK (
+    uploaded_by = current_app_user_id()
+    AND EXISTS (
+      SELECT 1 FROM projects p
+      WHERE p.id = project_id
+        AND (is_workspace_admin(p.workspace_id) OR can_perform_on_project(p.id, p.workspace_id, p.visibility, 'file.upload'))
+    )
+  );
+
+DROP POLICY IF EXISTS project_files_delete ON project_files;
+CREATE POLICY project_files_delete ON project_files
+  FOR DELETE USING (
+    uploaded_by = current_app_user_id()
+    OR EXISTS (
+      SELECT 1 FROM projects p
+      WHERE p.id = project_id
+        AND (is_workspace_admin(p.workspace_id) OR can_perform_on_project(p.id, p.workspace_id, p.visibility, 'file.manage'))
+    )
+  );

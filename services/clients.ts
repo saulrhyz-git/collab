@@ -2,6 +2,7 @@ import { eq, and, isNull, desc } from "drizzle-orm";
 import { db } from "../db/client";
 import { clients, projects, projectMembers, workspaceMembers, activityLogs } from "../db/schema";
 import { isSuperAdmin } from "../auth/super-admin";
+import { userHasWorkspacePermission } from "./permissions";
 
 export class NotAuthorizedError extends Error {}
 export class NotFoundError extends Error {}
@@ -14,12 +15,21 @@ async function isWorkspaceMember(workspaceId: string, userId: string) {
   return !!m;
 }
 
-async function isWorkspaceAdmin(workspaceId: string, userId: string) {
-  if (await isSuperAdmin(userId)) return true;
+async function getWorkspaceRole(workspaceId: string, userId: string) {
   const m = await db.query.workspaceMembers.findFirst({
     where: and(eq(workspaceMembers.workspaceId, workspaceId), eq(workspaceMembers.userId, userId)),
   });
-  return m?.role === "OWNER" || m?.role === "ADMIN";
+  return m?.role;
+}
+
+/**
+ * Matrix-governed ('client.manage') rather than a hardcoded OWNER/ADMIN
+ * check — see services/permissions.ts. Kept as a named helper since both
+ * updateClient and archiveClient need it.
+ */
+async function canManageClients(workspaceId: string, userId: string) {
+  const role = await getWorkspaceRole(workspaceId, userId);
+  return userHasWorkspacePermission(role, userId, "client.manage");
 }
 
 /**
@@ -39,7 +49,8 @@ export async function createClient(params: {
   const name = params.name.trim();
   if (!name) throw new Error("Client name is required.");
 
-  if (!(await isWorkspaceMember(params.workspaceId, params.createdBy))) {
+  const role = await getWorkspaceRole(params.workspaceId, params.createdBy);
+  if (!(await userHasWorkspacePermission(role, params.createdBy, "client.create"))) {
     throw new NotAuthorizedError("You must be a member of this workspace to add a client.");
   }
 
@@ -121,8 +132,8 @@ export async function updateClient(params: {
   const client = await db.query.clients.findFirst({ where: eq(clients.id, params.clientId) });
   if (!client) throw new NotFoundError("Client not found.");
 
-  const isAdmin = await isWorkspaceAdmin(client.workspaceId, params.actingUserId);
-  if (!isAdmin && client.createdBy !== params.actingUserId) {
+  const canManage = await canManageClients(client.workspaceId, params.actingUserId);
+  if (!canManage && client.createdBy !== params.actingUserId) {
     throw new NotAuthorizedError("Only the client's creator or a workspace admin can edit it.");
   }
 
@@ -146,7 +157,7 @@ export async function archiveClient(clientId: string, actingUserId: string) {
   const client = await db.query.clients.findFirst({ where: eq(clients.id, clientId) });
   if (!client) throw new NotFoundError("Client not found.");
 
-  if (!(await isWorkspaceAdmin(client.workspaceId, actingUserId))) {
+  if (!(await canManageClients(client.workspaceId, actingUserId))) {
     throw new NotAuthorizedError("Only a workspace admin can archive a client.");
   }
 

@@ -10,6 +10,7 @@ import {
   activityLogs,
 } from "../db/schema";
 import { isSuperAdmin } from "../auth/super-admin";
+import { userHasProjectPermission } from "./permissions";
 
 export class NotAuthorizedError extends Error {}
 export class NotFoundError extends Error {}
@@ -43,8 +44,15 @@ export async function requireProjectAccess(projectId: string, workspaceId: strin
   throw new NotAuthorizedError("You don't have access to this project.");
 }
 
-export function canWrite(role: string | undefined) {
-  return role === "PROJECT_ADMIN" || role === "EDITOR";
+/**
+ * Matrix-governed (role_permissions, key 'task.write') rather than a
+ * hardcoded role check — a super admin can change what EDITOR/VIEWER can do
+ * here via the permissions matrix without a code change. See
+ * services/permissions.ts and the matching has_project_permission() /
+ * can_perform_on_project() logic RLS independently enforces.
+ */
+export async function canWrite(role: string | undefined, userId: string): Promise<boolean> {
+  return userHasProjectPermission(role, userId, "task.write");
 }
 
 /**
@@ -119,7 +127,7 @@ export async function createTask(params: {
 }) {
   const project = await getProjectOrThrow(params.projectId);
   const role = await requireProjectAccess(params.projectId, project.workspaceId, params.reporterId);
-  if (!canWrite(role)) throw new NotAuthorizedError("Viewers cannot create tasks.");
+  if (!(await canWrite(role, params.reporterId))) throw new NotAuthorizedError("Viewers cannot create tasks.");
 
   if (params.assigneeId) {
     const assigneeIsMember = await db.query.projectMembers.findFirst({
@@ -180,7 +188,7 @@ export async function moveTask(params: {
 }) {
   const project = await getProjectOrThrow(params.projectId);
   const role = await requireProjectAccess(params.projectId, project.workspaceId, params.actingUserId);
-  if (!canWrite(role)) throw new NotAuthorizedError("Viewers cannot move tasks.");
+  if (!(await canWrite(role, params.actingUserId))) throw new NotAuthorizedError("Viewers cannot move tasks.");
 
   const task = await db.query.tasks.findFirst({
     where: and(eq(tasks.id, params.taskId), eq(tasks.projectId, params.projectId)),
@@ -277,7 +285,7 @@ export async function updateTask(params: {
   if (!task) throw new NotFoundError("Task not found.");
 
   const role = await requireProjectAccess(task.projectId, task.workspaceId, params.actingUserId);
-  if (!canWrite(role)) throw new NotAuthorizedError("Viewers cannot edit tasks.");
+  if (!(await canWrite(role, params.actingUserId))) throw new NotAuthorizedError("Viewers cannot edit tasks.");
 
   if (params.assigneeId) {
     const assigneeIsMember = await db.query.projectMembers.findFirst({

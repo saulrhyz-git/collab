@@ -25,3 +25,6 @@ next-env.d.ts
 
 # drizzle
 /drizzle/
+
+# per-engagement file uploads (services/project-files.ts) — local dev volume
+/uploads/

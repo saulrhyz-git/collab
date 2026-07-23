@@ -31,13 +31,35 @@ interface ClientSummary {
   name: string;
 }
 
+interface EngagementTypeSummary {
+  id: string;
+  name: string;
+}
+
 const NO_CLIENT = "__none__";
 const NEW_CLIENT = "__new__";
+const NO_ENGAGEMENT_TYPE = "__none__";
 
 async function fetchClients(workspaceId: string): Promise<ClientSummary[]> {
   const res = await fetch(`/api/workspaces/${workspaceId}/clients`, { credentials: "include" });
   if (!res.ok) throw new Error("Failed to load clients");
   return res.json();
+}
+
+async function fetchEngagementTypes(): Promise<EngagementTypeSummary[]> {
+  const res = await fetch("/api/admin/engagement-types", { credentials: "include" });
+  if (!res.ok) return []; // non-fatal — the picker just won't offer any
+  return res.json();
+}
+
+async function applyEngagementTypeToProject(projectId: string, engagementTypeId: string) {
+  const res = await fetch(`/api/projects/${projectId}/apply-template`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    credentials: "include",
+    body: JSON.stringify({ engagementTypeId }),
+  });
+  if (!res.ok) throw new Error((await res.json().catch(() => ({}))).error ?? "Failed to populate backlog");
 }
 
 async function createClient(workspaceId: string, name: string): Promise<ClientSummary> {
@@ -91,11 +113,18 @@ export default function CreateProjectDialog({
   );
   const [clientSelection, setClientSelection] = useState<string>(defaultClientId ?? NO_CLIENT);
   const [newClientName, setNewClientName] = useState("");
+  const [engagementTypeId, setEngagementTypeId] = useState<string>(NO_ENGAGEMENT_TYPE);
   const [error, setError] = useState<string | null>(null);
 
   const { data: clientOptions = [] } = useQuery({
     queryKey: ["clients", workspaceId],
     queryFn: () => fetchClients(workspaceId),
+    enabled: open,
+  });
+
+  const { data: engagementTypeOptions = [] } = useQuery({
+    queryKey: ["engagement-types"],
+    queryFn: fetchEngagementTypes,
     enabled: open,
   });
 
@@ -111,12 +140,23 @@ export default function CreateProjectDialog({
       } else if (clientSelection !== NO_CLIENT) {
         clientId = clientSelection;
       }
-      return createProject(workspaceId, {
+      const project = await createProject(workspaceId, {
         name,
         description: description || undefined,
         visibility,
         clientId,
       });
+
+      // Populate the backlog from the selected engagement type's linked
+      // templates. Best-effort: the project itself is already created by
+      // this point, so a failure here surfaces as an error but doesn't
+      // undo project creation — the user can apply a template manually
+      // from the engagement page instead.
+      if (engagementTypeId !== NO_ENGAGEMENT_TYPE) {
+        await applyEngagementTypeToProject(project.id, engagementTypeId);
+      }
+
+      return project;
     },
     onSuccess: (project) => {
       queryClient.invalidateQueries({ queryKey: ["projects", workspaceId] });
@@ -126,6 +166,7 @@ export default function CreateProjectDialog({
       setDescription("");
       setClientSelection(defaultClientId ?? NO_CLIENT);
       setNewClientName("");
+      setEngagementTypeId(NO_ENGAGEMENT_TYPE);
       router.push(`/projects/${project.id}`);
     },
     onError: (err: Error) => setError(err.message),
@@ -189,6 +230,28 @@ export default function CreateProjectDialog({
               />
             )}
           </div>
+
+          {engagementTypeOptions.length > 0 && (
+            <div className="space-y-1.5">
+              <label className="text-xs font-medium text-muted-foreground">Engagement type</label>
+              <Select value={engagementTypeId} onValueChange={setEngagementTypeId}>
+                <SelectTrigger>
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value={NO_ENGAGEMENT_TYPE}>None — start with an empty backlog</SelectItem>
+                  {engagementTypeOptions.map((t) => (
+                    <SelectItem key={t.id} value={t.id}>
+                      {t.name}
+                    </SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+              <p className="text-xs text-muted-foreground">
+                Populates the backlog from that type's linked task templates.
+              </p>
+            </div>
+          )}
 
           <Select value={visibility} onValueChange={(v) => setVisibility(v as typeof visibility)}>
             <SelectTrigger>

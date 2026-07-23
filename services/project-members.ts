@@ -9,6 +9,7 @@ import {
   activityLogs,
 } from "../db/schema";
 import { isSuperAdmin } from "../auth/super-admin";
+import { userHasProjectPermission } from "./permissions";
 
 export class NotAuthorizedError extends Error {}
 export class NotFoundError extends Error {}
@@ -22,6 +23,7 @@ async function getProjectOrThrow(projectId: string) {
   return project;
 }
 
+/** Structural bypass mirroring RLS's is_workspace_admin() — OWNER/ADMIN role or super admin, NOT matrix-governed. */
 async function isWorkspaceAdmin(workspaceId: string, userId: string) {
   if (await isSuperAdmin(userId)) return true;
   const m = await db.query.workspaceMembers.findFirst({
@@ -30,17 +32,20 @@ async function isWorkspaceAdmin(workspaceId: string, userId: string) {
   return m?.role === "OWNER" || m?.role === "ADMIN";
 }
 
-async function isProjectAdmin(projectId: string, userId: string) {
-  const m = await db.query.projectMembers.findFirst({
-    where: and(eq(projectMembers.projectId, projectId), eq(projectMembers.userId, userId)),
-  });
-  return m?.role === "PROJECT_ADMIN";
-}
-
+/**
+ * Mirrors project_members_insert/_delete RLS exactly:
+ * is_workspace_admin(workspace) OR has_project_permission(project, 'project.manage_members').
+ * Matrix-governed via services/permissions.ts (PROJECT_ADMIN holds
+ * 'project.manage_members' by default, replacing the old hardcoded check).
+ */
 async function assertCanManageMembers(projectId: string, workspaceId: string, actingUserId: string) {
-  if ((await isWorkspaceAdmin(workspaceId, actingUserId)) || (await isProjectAdmin(projectId, actingUserId))) {
-    return;
-  }
+  if (await isWorkspaceAdmin(workspaceId, actingUserId)) return;
+
+  const membership = await db.query.projectMembers.findFirst({
+    where: and(eq(projectMembers.projectId, projectId), eq(projectMembers.userId, actingUserId)),
+  });
+  if (await userHasProjectPermission(membership?.role, actingUserId, "project.manage_members")) return;
+
   throw new NotAuthorizedError("Only a project admin or workspace admin can manage members.");
 }
 

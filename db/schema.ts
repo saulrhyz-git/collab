@@ -410,6 +410,162 @@ export const activityLogsRelations = relations(activityLogs, ({ one }) => ({
   user: one(users, { fields: [activityLogs.userId], references: [users.id] }),
 }));
 
+// ---------------------------------------------------------------------------
+// RBAC permissions matrix — superadmin-only to edit (see db/rls-policies.sql).
+// `permissions` is a fixed, developer-maintained catalog (seeded via SQL,
+// not user-editable); `role_permissions` is the actual tickbox grid the
+// superadmin UI reads/writes. Both workspace roles (OWNER/ADMIN/MEMBER/GUEST)
+// and project roles (PROJECT_ADMIN/EDITOR/VIEWER) share this one table,
+// distinguished by `scope`.
+// ---------------------------------------------------------------------------
+
+export const permissionScopeEnum = pgEnum("permission_scope", ["WORKSPACE", "PROJECT"]);
+
+export const permissions = pgTable("permissions", {
+  key: varchar("key", { length: 100 }).primaryKey(),
+  label: varchar("label", { length: 200 }).notNull(),
+  scope: permissionScopeEnum("scope").notNull(),
+  description: text("description"),
+});
+
+export const rolePermissions = pgTable("role_permissions", {
+  id: uuid("id").primaryKey().defaultRandom(),
+  scope: permissionScopeEnum("scope").notNull(),
+  role: varchar("role", { length: 30 }).notNull(),
+  permissionKey: varchar("permission_key", { length: 100 }).notNull().references(() => permissions.key, { onDelete: "cascade" }),
+  granted: boolean("granted").notNull().default(false),
+  updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
+  updatedBy: uuid("updated_by").references(() => users.id),
+}, (t) => ({
+  uniqueGrant: uniqueIndex("role_permissions_unique_idx").on(t.scope, t.role, t.permissionKey),
+}));
+
+export const rolePermissionsRelations = relations(rolePermissions, ({ one }) => ({
+  permission: one(permissions, { fields: [rolePermissions.permissionKey], references: [permissions.key] }),
+  updatedByUser: one(users, { fields: [rolePermissions.updatedBy], references: [users.id] }),
+}));
+
+// ---------------------------------------------------------------------------
+// Task templates + engagement types — superadmin builds these; any member
+// with task-creation rights can apply one to populate a project's backlog.
+// ---------------------------------------------------------------------------
+
+export const taskTemplates = pgTable("task_templates", {
+  id: uuid("id").primaryKey().defaultRandom(),
+  name: varchar("name", { length: 200 }).notNull(),
+  description: text("description"),
+  createdBy: uuid("created_by").notNull().references(() => users.id),
+  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+  updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
+});
+
+export const taskTemplateItems = pgTable("task_template_items", {
+  id: uuid("id").primaryKey().defaultRandom(),
+  templateId: uuid("template_id").notNull().references(() => taskTemplates.id, { onDelete: "cascade" }),
+  title: varchar("title", { length: 300 }).notNull(),
+  description: text("description"),
+  priority: taskPriorityEnum("priority").notNull().default("MEDIUM"),
+  position: doublePrecision("position").notNull().default(0),
+}, (t) => ({
+  templatePositionIdx: index("task_template_items_template_position_idx").on(t.templateId, t.position),
+}));
+
+export const engagementTypes = pgTable("engagement_types", {
+  id: uuid("id").primaryKey().defaultRandom(),
+  name: varchar("name", { length: 200 }).notNull(),
+  description: text("description"),
+  createdBy: uuid("created_by").notNull().references(() => users.id),
+  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+});
+
+export const engagementTypeTemplates = pgTable("engagement_type_templates", {
+  engagementTypeId: uuid("engagement_type_id").notNull().references(() => engagementTypes.id, { onDelete: "cascade" }),
+  templateId: uuid("template_id").notNull().references(() => taskTemplates.id, { onDelete: "cascade" }),
+}, (t) => ({
+  pk: uniqueIndex("engagement_type_templates_pk").on(t.engagementTypeId, t.templateId),
+}));
+
+export const taskTemplatesRelations = relations(taskTemplates, ({ many }) => ({
+  items: many(taskTemplateItems),
+}));
+
+export const taskTemplateItemsRelations = relations(taskTemplateItems, ({ one }) => ({
+  template: one(taskTemplates, { fields: [taskTemplateItems.templateId], references: [taskTemplates.id] }),
+}));
+
+export const engagementTypesRelations = relations(engagementTypes, ({ many }) => ({
+  templates: many(engagementTypeTemplates),
+}));
+
+export const engagementTypeTemplatesRelations = relations(engagementTypeTemplates, ({ one }) => ({
+  engagementType: one(engagementTypes, { fields: [engagementTypeTemplates.engagementTypeId], references: [engagementTypes.id] }),
+  template: one(taskTemplates, { fields: [engagementTypeTemplates.templateId], references: [taskTemplates.id] }),
+}));
+
+// Projects optionally carry the engagement type they were created from —
+// purely informational once the backlog's been populated (re-applying is
+// always an explicit, separate action, never automatic).
+export const projectEngagementType = pgTable("project_engagement_type", {
+  projectId: uuid("project_id").primaryKey().references(() => projects.id, { onDelete: "cascade" }),
+  engagementTypeId: uuid("engagement_type_id").notNull().references(() => engagementTypes.id),
+});
+
+// ---------------------------------------------------------------------------
+// Platform settings — singleton rows (id is always fixed to 1), superadmin-only.
+// Secrets (smtp password, API keys) are stored encrypted — see lib/crypto-secrets.ts.
+// ---------------------------------------------------------------------------
+
+export const smtpSettings = pgTable("smtp_settings", {
+  id: integer("id").primaryKey().default(1),
+  host: varchar("host", { length: 255 }),
+  port: integer("port").default(587),
+  username: varchar("username", { length: 255 }),
+  encryptedPassword: text("encrypted_password"),
+  fromAddress: varchar("from_address", { length: 320 }),
+  fromName: varchar("from_name", { length: 200 }),
+  secure: boolean("secure").notNull().default(false),
+  updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
+  updatedBy: uuid("updated_by").references(() => users.id),
+});
+
+export const aiProviderSettings = pgTable("ai_provider_settings", {
+  id: integer("id").primaryKey().default(1),
+  openaiEncryptedKey: text("openai_encrypted_key"),
+  openaiModel: varchar("openai_model", { length: 100 }).default("gpt-4o"),
+  geminiEncryptedKey: text("gemini_encrypted_key"),
+  geminiModel: varchar("gemini_model", { length: 100 }).default("gemini-1.5-pro"),
+  defaultProvider: varchar("default_provider", { length: 20 }).default("openai"),
+  updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
+  updatedBy: uuid("updated_by").references(() => users.id),
+});
+
+// ---------------------------------------------------------------------------
+// Per-engagement file uploads — References tab + AI-reviewed documents.
+// ---------------------------------------------------------------------------
+
+export const fileCategoryEnum = pgEnum("file_category", ["REFERENCE", "AI_REVIEWED"]);
+
+export const projectFiles = pgTable("project_files", {
+  id: uuid("id").primaryKey().defaultRandom(),
+  projectId: uuid("project_id").notNull().references(() => projects.id, { onDelete: "cascade" }),
+  workspaceId: uuid("workspace_id").notNull().references(() => workspaces.id, { onDelete: "cascade" }),
+  fileName: varchar("file_name", { length: 300 }).notNull(),
+  mimeType: varchar("mime_type", { length: 150 }),
+  sizeBytes: integer("size_bytes").notNull().default(0),
+  storagePath: text("storage_path").notNull(),
+  category: fileCategoryEnum("category").notNull().default("REFERENCE"),
+  uploadedBy: uuid("uploaded_by").notNull().references(() => users.id),
+  aiReviewSummary: text("ai_review_summary"),
+  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+}, (t) => ({
+  projectIdx: index("project_files_project_idx").on(t.projectId),
+}));
+
+export const projectFilesRelations = relations(projectFiles, ({ one }) => ({
+  project: one(projects, { fields: [projectFiles.projectId], references: [projects.id] }),
+  uploader: one(users, { fields: [projectFiles.uploadedBy], references: [users.id] }),
+}));
+
 // Convenience TS types
 export type User = typeof users.$inferSelect;
 export type Workspace = typeof workspaces.$inferSelect;
@@ -422,3 +578,11 @@ export type Task = typeof tasks.$inferSelect;
 export type TaskDependency = typeof taskDependencies.$inferSelect;
 export type TaskComment = typeof taskComments.$inferSelect;
 export type ActivityLog = typeof activityLogs.$inferSelect;
+export type Permission = typeof permissions.$inferSelect;
+export type RolePermission = typeof rolePermissions.$inferSelect;
+export type TaskTemplate = typeof taskTemplates.$inferSelect;
+export type TaskTemplateItem = typeof taskTemplateItems.$inferSelect;
+export type EngagementType = typeof engagementTypes.$inferSelect;
+export type SmtpSettings = typeof smtpSettings.$inferSelect;
+export type AiProviderSettings = typeof aiProviderSettings.$inferSelect;
+export type ProjectFile = typeof projectFiles.$inferSelect;

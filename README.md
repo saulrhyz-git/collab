@@ -58,7 +58,10 @@ Requirements: Node 20+, Docker (for local Postgres) or your own Postgres 16 inst
 
 ### Updating an already-running install
 
-If you already had this app running, re-run steps 4 and 5 after pulling new code — both the clients/dashboard feature (new `clients` table, `projects.client_id`) and the RLS fixes below (existing tables, policies only) need it:
+If you already had this app running, re-run steps 4 and 5 after pulling new code — both the clients/dashboard feature (new `clients` table, `projects.client_id`) and the RLS fixes below (existing tables, policies only) need it. If you're picking up the RBAC/templates/AI-review/file-upload enhancements (see the section below), you'll also need two new env vars — copy them from `.env.example` into your `.env`:
+
+- `ENCRYPTION_KEY` — generate with `node -e "console.log(require('crypto').randomBytes(32).toString('base64'))"`. Encrypts SMTP passwords and AI provider API keys at rest (`lib/crypto-secrets.ts`).
+- `UPLOADS_DIR` — where per-engagement file uploads land on disk (default `./uploads`, gitignored).
 
 ```bash
 npm run db:push
@@ -83,8 +86,9 @@ Both classes of bug were verified against a real (embedded) Postgres instance en
 
 ### Notes on what's stubbed
 
-- `services/notifications.ts` logs to the console instead of actually sending email — swap in a real provider (Resend, SES, Postmark) before this goes further than local use.
+- `services/notifications.ts` sends real email once SMTP settings are configured at `/admin/permissions` → `/admin/smtp-settings`; until then it logs the invite link to the console instead.
 - Beyond the seeded super admin, the fastest way to get a second test user is to sign up a second account in an incognito window and invite it to a project from the first account's UI (project page → collaborators modal).
+- New runtime dependencies added for this pass: `nodemailer` (SMTP), `openai` + `@google/generative-ai` (AI review), `pdf-parse` + `mammoth` (document text extraction). Run `npm install` after pulling.
 
 ## Default workspace & project management
 
@@ -120,6 +124,54 @@ New routes: `GET/POST /api/workspaces/[workspaceId]/projects`, `GET/PATCH/DELETE
 
 Out of scope for this pass, deliberately: automations/rules, custom fields, and time tracking. The data model doesn't preclude adding them later.
 
+## Enhancements: theming, RBAC, templates, settings, file uploads, AI review
+
+### Theme
+
+Blue + gold, high contrast — CSS custom properties in `app/globals.css` (`--primary`, `--gold`, `--gold-foreground`, higher-contrast `--border`/`--muted-foreground` than shadcn's defaults), consumed via Tailwind's `hsl(var(--x))` pattern. `--gold`/`--gold-foreground` are new tokens added to `tailwind.config.ts`'s color palette alongside shadcn's existing set — used as an accent (header/sidebar border trim, active nav item, focus ring) rather than a wholesale color swap.
+
+### RBAC — permissions matrix
+
+A super-admin-only, tickbox-matrix permissions system, **fully wired** end to end rather than a display layer over unchanged hardcoded checks:
+
+- `permissions` (`db/schema.ts`) — a fixed, developer-maintained catalog: `key`, `label`, `scope` (`WORKSPACE` or `PROJECT`), `description`. Not editable through the app, including by super admins, so the keys code references by name can't drift.
+- `role_permissions` — the actual tickbox grid: `(scope, role, permission_key) -> granted`. This is what a super admin edits at `/admin/permissions`.
+- `services/permissions.ts` — `roleHasPermission`, `userHasWorkspacePermission`, `userHasProjectPermission` (both include the super-admin bypass), `getPermissionMatrix`/`setRolePermission` (superadmin-only writes) for the UI. Grants are cached in memory for 15s and invalidated on any write, since nearly every authorization check across the app reads this table.
+- **RLS enforces the same matrix independently** — `has_permission()`/`has_workspace_permission()`/`has_project_permission()`/`can_perform_on_project()` in `db/rls-policies.sql` read `role_permissions` directly, so a route that forgot to call the TypeScript check still can't bypass it at the database layer.
+- Every previously-hardcoded role check this pass touched — client create/manage, project create/manage, project edit, workspace/project member management, task write/comment — now consults the matrix on both sides (service layer + RLS) instead of a hardcoded `role === 'ADMIN'`-style check. A few things are deliberately kept as **structural bypasses outside the matrix** (not togglable): super-admin's platform-wide override, a workspace's `OWNER`/`ADMIN` oversight bypass on writes, the workspace owner can't be removed, and the various signup/invite-acceptance bootstrap branches (a user adding themselves as the first member of something they just created). Sending/revoking project invitations is also left as a structural check (`services/invitations.ts`), not matrix-governed — there's no catalog entry for it, on purpose, since RLS's own `project_invitations_insert` policy is intentionally looser than the in-app check for that action.
+- UI: `/admin/permissions` — a tickbox grid, one tab for Workspace-scope roles and one for Project-scope roles, superadmin-only (redirects otherwise; the route also checks and returns 403).
+
+### Task list templates & engagement types
+
+Build once, apply many times — a super admin defines reusable task lists and links them to a named "engagement type"; anyone who already has task-creation rights on a project can apply one to populate its backlog.
+
+- `task_templates` / `task_template_items` — a named list of tasks (title, description, priority) in order.
+- `engagement_types` / `engagement_type_templates` — a many-to-many link from a named engagement type to one or more templates.
+- `project_engagement_type` — informational: which engagement type (if any) a project was created from. Re-applying is always a separate, explicit action, never automatic.
+- `services/task-templates.ts`, `services/engagement-types.ts` — CRUD, superadmin-only writes (RLS backs this up: `task_templates_write`/`engagement_types_write` require `is_super_admin()`), reads open to any authenticated user (the picker needs it).
+- `services/apply-template.ts` — `applyTaskTemplate` / `applyEngagementType`, the actual "populate the backlog" action. Gated by the same bar as creating a single task by hand (`task.write`, matrix-governed) — **not** superadmin-only, per the product decision that template *building* is superadmin-only but template *use* is available to whoever can already create tasks.
+- UI: `/admin/task-templates` and `/admin/engagement-types` (superadmin builders). `components/CreateProjectDialog.tsx` gained an engagement-type picker that populates the backlog right after creating the project. `components/ApplyTemplateDialog.tsx` (an "Apply template" button in the project header) lets it happen later, on an existing engagement, too.
+
+### SMTP settings
+
+`/admin/smtp-settings` (superadmin-only) — host, port, username, password, from address/name, TLS toggle. The password is encrypted at rest (`lib/crypto-secrets.ts`, AES-256-GCM) and the GET endpoint never returns it decrypted — only whether one is currently set. `services/notifications.ts` now actually sends invite email through whatever's configured (via `nodemailer`), falling back to a console-log of the invite link if nothing's set up yet (keeps local dev/testing working without a mail server).
+
+### AI provider settings & "Review via AI"
+
+`/admin/ai-provider-settings` (superadmin-only) — API keys for OpenAI and Google Gemini, plus a **free-text model field per provider** (not a hardcoded dropdown — e.g. `gpt-4o`, `gemini-1.5-pro` are just defaults; point it at whatever model string your account actually has access to, since model lineups change faster than this code does), and a default-provider toggle. Keys are encrypted at rest the same way as the SMTP password.
+
+`services/ai-review.ts` extracts text from an uploaded document (`lib/document-text-extraction.ts` — PDF via `pdf-parse`, Word via `mammoth`, plain text/markdown directly; anything else is rejected with a clear error) and sends it to the configured provider with a prompt asking for a structured legal-document review: a plain-language summary, recommendations, and notable clauses/risks — worded for contracts, MOAs, and similar documents, and explicit that it isn't legal advice. Gated by the `ai_review.run` permission (matrix-governed, PROJECT scope).
+
+### Per-engagement file uploads
+
+Local disk, app-controlled volume (`UPLOADS_DIR`, default `./uploads`) — `lib/file-storage.ts` namespaces files by workspace/project and sanitizes filenames so a crafted upload name can't path-traverse out of its own project's folder. `project_files` (`db/schema.ts`) tracks `category` (`REFERENCE` or `AI_REVIEWED`), the uploader, and (once reviewed) the AI analysis. `services/project-files.ts` mirrors `project_files` RLS exactly: read follows plain project visibility, upload requires `file.upload` (matrix-governed) or workspace admin, delete requires being the uploader, `file.manage`, or workspace admin.
+
+Inside a project, this shows up as two new views (see below): **References** (the shared library) and **AI Review** (upload a document, click "Review via AI", then optionally "Add to References" once you're happy with it — that's just a category flip from `AI_REVIEWED` to `REFERENCE`, not a copy).
+
+### Collapsible sidebar for project views
+
+`app/projects/[projectId]/project-shell.tsx` — now five views (Board, List, Gantt, References, AI Review), moved from a horizontal tab bar into a collapsible left sidebar (icon-only when collapsed) so the extra two views don't crowd a horizontal bar and the board/list/gantt content gets more width.
+
 ## File map
 
 - `db/schema.ts` — Drizzle schema: workspaces, clients, projects, tasks (+ subtasks + dependencies + comments), memberships, invitations, activity log.
@@ -137,14 +189,23 @@ Out of scope for this pass, deliberately: automations/rules, custom fields, and 
 - `services/dashboard.ts` — `getWorkspaceDashboard`, the landing page's single aggregate query.
 - `services/invitations.ts` — `sendProjectInvite`, `acceptProjectInvite`, `revokeProjectInvite`.
 - `services/workspace-members.ts` — `removeWorkspaceMember`, with task-reassignment handling.
-- `services/notifications.ts` — email/in-app adapters.
+- `services/notifications.ts` — email/in-app adapters; email now goes through `services/smtp-settings.ts`'s configured server via `nodemailer`.
+- `services/permissions.ts` — the RBAC matrix: `userHasWorkspacePermission`/`userHasProjectPermission`, `getPermissionMatrix`/`setRolePermission`.
+- `services/task-templates.ts`, `services/engagement-types.ts`, `services/apply-template.ts` — template/engagement-type CRUD and the backlog-population action.
+- `services/smtp-settings.ts`, `services/ai-provider-settings.ts` — superadmin-managed platform settings; secrets encrypted via `lib/crypto-secrets.ts`.
+- `services/project-files.ts` — per-engagement file upload/list/download/delete, local-disk storage via `lib/file-storage.ts`.
+- `services/ai-review.ts` — the "Review via AI" action; text extraction via `lib/document-text-extraction.ts`, provider calls via `openai`/`@google/generative-ai`.
 - `scripts/seed-superadmin.ts` — creates/promotes the super admin account from `.env`.
-- `app/api/**/route.ts` — Next.js route handlers wiring the above into HTTP.
-- `app/dashboard-shell.tsx` — the post-login landing page: stats, my tasks, upcoming deadlines, recent activity, clients/engagements roster.
-- `app/projects/[projectId]/` — project detail page and the Board/List/Gantt tab shell.
+- `app/api/**/route.ts` — Next.js route handlers wiring the above into HTTP, including `app/api/admin/**` (permissions, task templates, engagement types, SMTP/AI settings — all superadmin-gated) and `app/api/projects/[projectId]/files/**` (uploads, download, delete, promote, AI review).
+- `app/dashboard-shell.tsx` — the post-login landing page: stats, my tasks, upcoming deadlines, recent activity, clients/engagements roster, and a superadmin-only "Admin" menu (permissions matrix, task templates, engagement types, SMTP settings, AI provider settings).
+- `app/admin/**` — superadmin-only pages: permissions matrix, task template builder, engagement type builder, SMTP settings, AI provider settings.
+- `app/projects/[projectId]/` — project detail page and the collapsible-sidebar view shell (Board/List/Gantt/References/AI Review).
 - `app/clients/[clientId]/` — client detail page (contact info, notes, engagements).
 - `lib/format-activity.ts` — turns an activity-log row into a human sentence for the recent-activity feed.
-- `components/*.tsx` — WorkspaceSelector, ProjectCollaboratorModal, KanbanBoard, TaskListView, GanttChart, TaskDetailPanel, CreateProjectDialog, CreateClientDialog, plus the shadcn/ui primitives under `components/ui/`.
+- `lib/crypto-secrets.ts` — AES-256-GCM encrypt/decrypt for secrets at rest (`ENCRYPTION_KEY`).
+- `lib/file-storage.ts` — local-disk file storage helpers (`UPLOADS_DIR`).
+- `lib/document-text-extraction.ts` — PDF/Word/text extraction for the AI review flow.
+- `components/*.tsx` — WorkspaceSelector, ProjectCollaboratorModal, KanbanBoard, TaskListView, GanttChart, TaskDetailPanel, CreateProjectDialog, CreateClientDialog, ApplyTemplateDialog, ReferencesTab, AiReviewTab, plus the shadcn/ui primitives under `components/ui/`.
 - `realtime/socket-server.ts` — Socket.io server with room-based project isolation.
 
 ## Step 5: Security & edge cases
