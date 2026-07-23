@@ -82,7 +82,13 @@ function positionBetween(before?: number, after?: number): number {
   return (before + after) / 2;
 }
 
-export default function KanbanBoard({ projectId }: { projectId: string }) {
+export default function KanbanBoard({
+  projectId,
+  onTaskClick,
+}: {
+  projectId: string;
+  onTaskClick?: (taskId: string) => void;
+}) {
   const queryClient = useQueryClient();
   const [activeTask, setActiveTask] = useState<TaskCard | null>(null);
   const [socket, setSocket] = useState<Socket | null>(null);
@@ -169,7 +175,13 @@ export default function KanbanBoard({ projectId }: { projectId: string }) {
     >
       <div className="flex gap-4 overflow-x-auto pb-4">
         {COLUMNS.map((col) => (
-          <KanbanColumn key={col.id} status={col.id} label={col.label} tasks={columns.get(col.id) ?? []} />
+          <KanbanColumn
+            key={col.id}
+            status={col.id}
+            label={col.label}
+            tasks={columns.get(col.id) ?? []}
+            onTaskClick={onTaskClick}
+          />
         ))}
       </div>
       <DragOverlay>{activeTask && <TaskCardView task={activeTask} />}</DragOverlay>
@@ -181,10 +193,12 @@ function KanbanColumn({
   status,
   label,
   tasks,
+  onTaskClick,
 }: {
   status: TaskStatus;
   label: string;
   tasks: TaskCard[];
+  onTaskClick?: (taskId: string) => void;
 }) {
   return (
     <div className="w-72 shrink-0 rounded-lg bg-muted/50 p-2">
@@ -195,7 +209,7 @@ function KanbanColumn({
       <SortableContext items={tasks.map((t) => t.id)} strategy={verticalListSortingStrategy}>
         <div className="flex flex-col gap-2 min-h-[4px]" data-status={status} id={status}>
           {tasks.map((task) => (
-            <SortableTaskCard key={task.id} task={task} />
+            <SortableTaskCard key={task.id} task={task} onTaskClick={onTaskClick} />
           ))}
         </div>
       </SortableContext>
@@ -203,7 +217,13 @@ function KanbanColumn({
   );
 }
 
-function SortableTaskCard({ task }: { task: TaskCard }) {
+function SortableTaskCard({
+  task,
+  onTaskClick,
+}: {
+  task: TaskCard;
+  onTaskClick?: (taskId: string) => void;
+}) {
   const { attributes, listeners, setNodeRef, transform, transition, isDragging } = useSortable({
     id: task.id,
     data: { status: task.status },
@@ -216,7 +236,7 @@ function SortableTaskCard({ task }: { task: TaskCard }) {
   };
 
   return (
-    <div ref={setNodeRef} style={style} {...attributes} {...listeners}>
+    <div ref={setNodeRef} style={style} {...attributes} {...listeners} onClick={() => onTaskClick?.(task.id)}>
       <TaskCardView task={task} />
     </div>
   );

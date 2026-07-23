@@ -38,7 +38,7 @@ Requirements: Node 20+, Docker (for local Postgres) or your own Postgres 16 inst
    npm run dev
    ```
 
-   Visit `http://localhost:3000` — you'll land on `/login`, where you can create an account (this auto-provisions your personal workspace).
+   Visit `http://localhost:3000` — you'll land on `/login`, where you can create an account (this auto-provisions your personal workspace). After signing in you land on that workspace's dashboard, which lists your projects and lets you create new ones — see "Default workspace & project management" below.
 
 7. (Optional, for live Kanban updates across browser tabs/users) start the realtime server in a second terminal:
 
@@ -64,21 +64,51 @@ Requirements: Node 20+, Docker (for local Postgres) or your own Postgres 16 inst
 ### Notes on what's stubbed
 
 - `services/notifications.ts` logs to the console instead of actually sending email — swap in a real provider (Resend, SES, Postmark) before this goes further than local use.
-- Beyond the seeded super admin, the fastest way to get a second test user is to sign up a second account in an incognito window and invite it to a project from the first account's UI (once you wire a project page up to `components/KanbanBoard.tsx` and `ProjectCollaboratorModal.tsx` — the dashboard shell at `app/page.tsx` is currently a minimal placeholder that only renders the workspace switcher).
+- Beyond the seeded super admin, the fastest way to get a second test user is to sign up a second account in an incognito window and invite it to a project from the first account's UI (project page → collaborators modal).
+
+## Default workspace & project management
+
+Every account gets a personal workspace on signup (see `auth/signup.ts`). Signing in lands on that workspace's dashboard (`app/dashboard-shell.tsx`): a grid of the workspace's projects, an empty state with a "New project" call to action if there are none yet, and a create-project dialog (`components/CreateProjectDialog.tsx`). A super admin sees every project across every workspace here, not just ones they're a member of.
+
+Opening a project goes to `app/projects/[projectId]/page.tsx` → `project-shell.tsx`, which switches between three views of the same task data via tabs:
+
+- **Board** (`components/KanbanBoard.tsx`) — drag-and-drop columns by status (Backlog/To Do/In Progress/In Review/Done), fractional-index positioning so reordering never rewrites the whole column, realtime sync across tabs/users via Socket.io (`task:moved`, `task:created`).
+- **List** (`components/TaskListView.tsx`) — tasks grouped by status in collapsible sections, one level of subtask nesting indented under its parent, inline quick-add per group.
+- **Gantt** (`components/GanttChart.tsx`) — a custom-built timeline (no third-party Gantt library): sticky task-label column, day/month grid, bars positioned by `startDate`/`dueDate`, an SVG overlay drawing elbow-connector lines for dependencies and a dashed line marking today, and a footer listing tasks with no dates yet.
+
+Clicking any task in any view opens `components/TaskDetailPanel.tsx` (a right-side slide-over built on Radix Dialog, see `components/ui/sheet.tsx`): editable title, status, priority, assignee, dates, and description; a subtasks list; add/remove dependencies (with cycle detection — see below); and a comment thread.
+
+New data model to support this (`db/schema.ts`):
+
+- `tasks` gained `parent_task_id` (self-referencing FK, one level of nesting enforced at the service layer) and `start_date`.
+- `task_dependencies` — predecessor/successor task pairs plus a `type` (`FINISH_TO_START`, `START_TO_START`, `FINISH_TO_FINISH`, `START_TO_FINISH`, matching MS Project/Asana Timeline semantics). `services/task-dependencies.ts` does a BFS cycle check (`wouldCreateCycle`) before allowing an insert and throws `CyclicDependencyError` (mapped to HTTP 409) if adding the edge would create a loop.
+- `task_comments` — flat per-task comment thread, delete restricted to the author or a `PROJECT_ADMIN`.
+
+New routes: `GET/POST /api/workspaces/[workspaceId]/projects`, `GET/PATCH/DELETE /api/projects/[projectId]`, `GET/PATCH /api/projects/[projectId]/tasks/[taskId]` (task detail), `GET /api/projects/[projectId]/dependencies` (whole-project dependency list, for the Gantt overlay), `POST /api/projects/[projectId]/tasks/[taskId]/dependencies` and `DELETE .../dependencies/[dependencyId]`, `GET/POST /api/projects/[projectId]/tasks/[taskId]/comments` and `DELETE .../comments/[commentId]`.
+
+Out of scope for this pass, deliberately: automations/rules, custom fields, and time tracking. The data model doesn't preclude adding them later.
 
 ## File map
 
-- `db/schema.ts` — Drizzle schema, all eight tables, enums, indexes, relations.
-- `db/rls-policies.sql` — RLS enablement + policies, run after the Drizzle migration.
-- `db/with-rls-context.ts`, `db/client.ts` — the transaction wrapper that sets the `app.current_user_id` / `app.current_workspace_id` session GUCs every policy reads.
+- `db/schema.ts` — Drizzle schema: workspaces, projects, tasks (+ subtasks + dependencies + comments), memberships, invitations, activity log.
+- `db/rls-policies.sql` — RLS enablement + policies, run after the Drizzle migration. Includes the `is_super_admin()` bypass baked into every membership-check function.
+- `db/client.ts` — Postgres pool, Drizzle instance, and the `AsyncLocalStorage`-based `runWithRlsContext` wrapper that sets the `app.current_user_id` / `app.current_workspace_id` session GUCs every RLS policy reads, transparently, for every query issued through `db` during a request. `db/with-rls-context.ts` re-exports the same function for backwards compatibility.
 - `auth/signup.ts` — signup + automatic personal workspace provisioning.
 - `auth/auth.config.ts`, `auth/index.ts` — NextAuth v5 credentials provider, JWT callbacks.
-- `auth/workspace-context.middleware.ts` — resolves and **verifies** the active workspace on every request.
+- `auth/workspace-context.middleware.ts` — resolves and **verifies** the active workspace on every request; also where the super-admin bypass short-circuits the membership lookup.
+- `auth/super-admin.ts` — `isSuperAdmin(userId)` check used by the middleware, services, and the realtime server.
+- `services/projects.ts` — `createProject`, `listProjectsForWorkspace` (super admin sees all), `getProject`, `updateProject`, `archiveProject`.
+- `services/tasks.ts` — CRUD plus `getTaskDetail` (task + assignee + reporter + subtasks + dependency edges in one call).
+- `services/task-dependencies.ts` — add/remove dependency, cycle detection.
+- `services/task-comments.ts` — list/add/delete comments.
 - `services/invitations.ts` — `sendProjectInvite`, `acceptProjectInvite`, `revokeProjectInvite`.
 - `services/workspace-members.ts` — `removeWorkspaceMember`, with task-reassignment handling.
 - `services/notifications.ts` — email/in-app adapters.
+- `scripts/seed-superadmin.ts` — creates/promotes the super admin account from `.env`.
 - `app/api/**/route.ts` — Next.js route handlers wiring the above into HTTP.
-- `components/*.tsx` — WorkspaceSelector, ProjectCollaboratorModal, KanbanBoard.
+- `app/dashboard-shell.tsx` — workspace project list + create-project dialog.
+- `app/projects/[projectId]/` — project detail page and the Board/List/Gantt tab shell.
+- `components/*.tsx` — WorkspaceSelector, ProjectCollaboratorModal, KanbanBoard, TaskListView, GanttChart, TaskDetailPanel, CreateProjectDialog, plus the shadcn/ui primitives under `components/ui/`.
 - `realtime/socket-server.ts` — Socket.io server with room-based project isolation.
 
 ## Step 5: Security & edge cases

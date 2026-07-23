@@ -25,6 +25,7 @@ import {
   uniqueIndex,
   index,
   doublePrecision,
+  type AnyPgColumn,
 } from "drizzle-orm/pg-core";
 import { relations } from "drizzle-orm";
 
@@ -74,6 +75,15 @@ export const taskPriorityEnum = pgEnum("task_priority", [
   "MEDIUM",
   "HIGH",
   "URGENT",
+]);
+
+export const dependencyTypeEnum = pgEnum("dependency_type", [
+  // Matches standard Gantt dependency semantics (MS Project / Asana Timeline):
+  // successor can't start until predecessor finishes, etc.
+  "FINISH_TO_START",
+  "START_TO_START",
+  "FINISH_TO_FINISH",
+  "START_TO_FINISH",
 ]);
 
 // ---------------------------------------------------------------------------
@@ -205,12 +215,22 @@ export const tasks = pgTable("tasks", {
   id: uuid("id").primaryKey().defaultRandom(),
   projectId: uuid("project_id").notNull().references(() => projects.id, { onDelete: "cascade" }),
   workspaceId: uuid("workspace_id").notNull().references(() => workspaces.id, { onDelete: "cascade" }), // denormalized for RLS + index locality
+  // Self-reference for subtasks (Asana/ClickUp-style one level of nesting is
+  // enforced at the app layer, not the DB — Postgres has no easy CHECK for
+  // "depth <= 1", and real PM tools rarely need more than one level anyway).
+  // The callback form (AnyPgColumn) is required for self-referencing FKs in
+  // Drizzle since `tasks` isn't in scope yet at this point in its own definition.
+  parentTaskId: uuid("parent_task_id").references((): AnyPgColumn => tasks.id, { onDelete: "cascade" }),
   title: varchar("title", { length: 300 }).notNull(),
   description: text("description"),
   status: taskStatusEnum("status").notNull().default("TODO"),
   priority: taskPriorityEnum("priority").notNull().default("MEDIUM"),
   assigneeId: uuid("assignee_id").references(() => users.id, { onDelete: "set null" }),
   reporterId: uuid("reporter_id").notNull().references(() => users.id),
+  // startDate + dueDate together define the Gantt bar; startDate is
+  // optional (a task can have only a due date, same as most PM tools) but
+  // required for that task to render as a bar rather than a milestone diamond.
+  startDate: timestamp("start_date", { withTimezone: true }),
   dueDate: timestamp("due_date", { withTimezone: true }),
   // Fractional-index positioning (e.g. "a0", "a1", "a0m") avoids re-writing
   // every row in a column on each drag-and-drop reorder.
@@ -222,6 +242,42 @@ export const tasks = pgTable("tasks", {
   assigneeIdx: index("tasks_assignee_idx").on(t.assigneeId),
   workspaceIdx: index("tasks_workspace_idx").on(t.workspaceId),
   dueDateIdx: index("tasks_due_date_idx").on(t.dueDate),
+  parentTaskIdx: index("tasks_parent_task_idx").on(t.parentTaskId),
+}));
+
+// ---------------------------------------------------------------------------
+// task_dependencies — powers the Gantt view's blocking relationships.
+// predecessor must (per `type`) reach the relevant milestone before the
+// successor can — same model as MS Project / Asana Timeline.
+// ---------------------------------------------------------------------------
+
+export const taskDependencies = pgTable("task_dependencies", {
+  id: uuid("id").primaryKey().defaultRandom(),
+  predecessorTaskId: uuid("predecessor_task_id").notNull().references(() => tasks.id, { onDelete: "cascade" }),
+  successorTaskId: uuid("successor_task_id").notNull().references(() => tasks.id, { onDelete: "cascade" }),
+  type: dependencyTypeEnum("type").notNull().default("FINISH_TO_START"),
+  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+}, (t) => ({
+  uniquePair: uniqueIndex("task_dependencies_unique_pair_idx").on(t.predecessorTaskId, t.successorTaskId),
+  successorIdx: index("task_dependencies_successor_idx").on(t.successorTaskId),
+}));
+
+// ---------------------------------------------------------------------------
+// task_comments — flat discussion thread per task (no nested replies; every
+// best-of-class tool's task activity feed is effectively flat + @mentions,
+// which is a notification concern, not a data-modeling one, so left out of
+// v1).
+// ---------------------------------------------------------------------------
+
+export const taskComments = pgTable("task_comments", {
+  id: uuid("id").primaryKey().defaultRandom(),
+  taskId: uuid("task_id").notNull().references(() => tasks.id, { onDelete: "cascade" }),
+  authorId: uuid("author_id").notNull().references(() => users.id),
+  body: text("body").notNull(),
+  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+  editedAt: timestamp("edited_at", { withTimezone: true }),
+}, (t) => ({
+  taskTimeIdx: index("task_comments_task_time_idx").on(t.taskId, t.createdAt),
 }));
 
 // ---------------------------------------------------------------------------
@@ -282,11 +338,34 @@ export const projectInvitationsRelations = relations(projectInvitations, ({ one 
   inviteeUser: one(users, { fields: [projectInvitations.inviteeUserId], references: [users.id] }),
 }));
 
-export const tasksRelations = relations(tasks, ({ one }) => ({
+export const tasksRelations = relations(tasks, ({ one, many }) => ({
   project: one(projects, { fields: [tasks.projectId], references: [projects.id] }),
   workspace: one(workspaces, { fields: [tasks.workspaceId], references: [workspaces.id] }),
   assignee: one(users, { fields: [tasks.assigneeId], references: [users.id] }),
   reporter: one(users, { fields: [tasks.reporterId], references: [users.id] }),
+  parentTask: one(tasks, { fields: [tasks.parentTaskId], references: [tasks.id], relationName: "subtasks" }),
+  subtasks: many(tasks, { relationName: "subtasks" }),
+  comments: many(taskComments),
+  dependenciesAsPredecessor: many(taskDependencies, { relationName: "predecessor" }),
+  dependenciesAsSuccessor: many(taskDependencies, { relationName: "successor" }),
+}));
+
+export const taskDependenciesRelations = relations(taskDependencies, ({ one }) => ({
+  predecessor: one(tasks, {
+    fields: [taskDependencies.predecessorTaskId],
+    references: [tasks.id],
+    relationName: "predecessor",
+  }),
+  successor: one(tasks, {
+    fields: [taskDependencies.successorTaskId],
+    references: [tasks.id],
+    relationName: "successor",
+  }),
+}));
+
+export const taskCommentsRelations = relations(taskComments, ({ one }) => ({
+  task: one(tasks, { fields: [taskComments.taskId], references: [tasks.id] }),
+  author: one(users, { fields: [taskComments.authorId], references: [users.id] }),
 }));
 
 export const activityLogsRelations = relations(activityLogs, ({ one }) => ({
@@ -303,4 +382,6 @@ export type Project = typeof projects.$inferSelect;
 export type ProjectMember = typeof projectMembers.$inferSelect;
 export type ProjectInvitation = typeof projectInvitations.$inferSelect;
 export type Task = typeof tasks.$inferSelect;
+export type TaskDependency = typeof taskDependencies.$inferSelect;
+export type TaskComment = typeof taskComments.$inferSelect;
 export type ActivityLog = typeof activityLogs.$inferSelect;

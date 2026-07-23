@@ -290,6 +290,72 @@ CREATE POLICY tasks_write ON tasks
   );
 
 -- ---------------------------------------------------------------------------
+-- task_dependencies — Gantt blocking relationships. Visibility/write rights
+-- are inherited from the successor task's project (arbitrary but
+-- consistent choice — a dependency is meaningless without both ends
+-- existing in the same project, which the app layer enforces on insert).
+-- ---------------------------------------------------------------------------
+ALTER TABLE task_dependencies ENABLE ROW LEVEL SECURITY;
+ALTER TABLE task_dependencies FORCE ROW LEVEL SECURITY;
+
+CREATE POLICY task_dependencies_select ON task_dependencies
+  FOR SELECT USING (
+    EXISTS (
+      SELECT 1 FROM tasks t
+      JOIN projects p ON p.id = t.project_id
+      WHERE t.id = successor_task_id AND can_access_project(p.id, p.workspace_id, p.visibility)
+    )
+  );
+
+CREATE POLICY task_dependencies_write ON task_dependencies
+  FOR ALL USING (
+    EXISTS (
+      SELECT 1 FROM tasks t
+      JOIN project_members pm ON pm.project_id = t.project_id
+      WHERE t.id = successor_task_id
+        AND pm.user_id = current_app_user_id()
+        AND pm.role IN ('PROJECT_ADMIN', 'EDITOR')
+    )
+    OR EXISTS (
+      SELECT 1 FROM tasks t WHERE t.id = successor_task_id AND is_workspace_admin(t.workspace_id)
+    )
+  );
+
+-- ---------------------------------------------------------------------------
+-- task_comments — anyone who can see the task can read comments; anyone who
+-- can see the task can post one (commenting is lower-privilege than editing
+-- the task itself — VIEWER-role project members can weigh in even though
+-- they can't move or edit the task, same as Asana/Linear).
+-- ---------------------------------------------------------------------------
+ALTER TABLE task_comments ENABLE ROW LEVEL SECURITY;
+ALTER TABLE task_comments FORCE ROW LEVEL SECURITY;
+
+CREATE POLICY task_comments_select ON task_comments
+  FOR SELECT USING (
+    EXISTS (
+      SELECT 1 FROM tasks t
+      JOIN projects p ON p.id = t.project_id
+      WHERE t.id = task_id AND can_access_project(p.id, p.workspace_id, p.visibility)
+    )
+  );
+
+CREATE POLICY task_comments_insert ON task_comments
+  FOR INSERT WITH CHECK (
+    author_id = current_app_user_id()
+    AND EXISTS (
+      SELECT 1 FROM tasks t
+      JOIN projects p ON p.id = t.project_id
+      WHERE t.id = task_id AND can_access_project(p.id, p.workspace_id, p.visibility)
+    )
+  );
+
+CREATE POLICY task_comments_delete ON task_comments
+  FOR DELETE USING (
+    author_id = current_app_user_id()
+    OR EXISTS (SELECT 1 FROM tasks t WHERE t.id = task_id AND is_workspace_admin(t.workspace_id))
+  );
+
+-- ---------------------------------------------------------------------------
 -- activity_logs — append-only, readable by anyone who can see the project/workspace
 -- ---------------------------------------------------------------------------
 ALTER TABLE activity_logs ENABLE ROW LEVEL SECURITY;

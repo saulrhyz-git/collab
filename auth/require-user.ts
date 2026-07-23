@@ -48,6 +48,7 @@ export function mapDomainError(err: unknown): NextResponse | null {
     case "InviteExpiredError":
       return NextResponse.json({ error: (err as Error).message || "Expired" }, { status: 410 });
     case "CannotRemoveLastAdminError":
+    case "CyclicDependencyError":
       return NextResponse.json({ error: (err as Error).message || "Conflict" }, { status: 409 });
     default:
       return null;
