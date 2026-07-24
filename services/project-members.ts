@@ -9,7 +9,7 @@ import {
   activityLogs,
 } from "../db/schema";
 import { isSuperAdmin } from "../auth/super-admin";
-import { userHasProjectPermission } from "./permissions";
+import { userCanPerformOnProject } from "./permissions";
 
 export class NotAuthorizedError extends Error {}
 export class NotFoundError extends Error {}
@@ -33,19 +33,23 @@ async function isWorkspaceAdmin(workspaceId: string, userId: string) {
 }
 
 /**
- * Mirrors project_members_insert/_delete RLS exactly:
- * is_workspace_admin(workspace) OR has_project_permission(project, 'project.manage_members').
- * Matrix-governed via services/permissions.ts (PROJECT_ADMIN holds
- * 'project.manage_members' by default, replacing the old hardcoded check).
+ * Mirrors project_members_update/_delete RLS exactly (now split from the
+ * old single 'project.manage_members' key): is_workspace_admin(workspace)
+ * OR has_project_permission(project, 'members.edit'|'members.delete'),
+ * plus recognizing custom roles and client-wide grants via
+ * userCanPerformOnProject (which already includes the workspace-admin
+ * bypass, so isWorkspaceAdmin is redundant here but kept for clarity/speed
+ * on the common case).
  */
-async function assertCanManageMembers(projectId: string, workspaceId: string, actingUserId: string) {
+async function assertCanEditMembers(projectId: string, workspaceId: string, actingUserId: string) {
   if (await isWorkspaceAdmin(workspaceId, actingUserId)) return;
+  if (await userCanPerformOnProject(actingUserId, projectId, "members.edit")) return;
+  throw new NotAuthorizedError("Only a project admin or workspace admin can manage members.");
+}
 
-  const membership = await db.query.projectMembers.findFirst({
-    where: and(eq(projectMembers.projectId, projectId), eq(projectMembers.userId, actingUserId)),
-  });
-  if (await userHasProjectPermission(membership?.role, actingUserId, "project.manage_members")) return;
-
+async function assertCanRemoveMembers(projectId: string, workspaceId: string, actingUserId: string) {
+  if (await isWorkspaceAdmin(workspaceId, actingUserId)) return;
+  if (await userCanPerformOnProject(actingUserId, projectId, "members.delete")) return;
   throw new NotAuthorizedError("Only a project admin or workspace admin can manage members.");
 }
 
@@ -85,7 +89,7 @@ export async function updateProjectMemberRole(params: {
 }) {
   const { projectId, targetUserId, newRole, actingUserId } = params;
   const project = await getProjectOrThrow(projectId);
-  await assertCanManageMembers(projectId, project.workspaceId, actingUserId);
+  await assertCanEditMembers(projectId, project.workspaceId, actingUserId);
 
   const target = await db.query.projectMembers.findFirst({
     where: and(eq(projectMembers.projectId, projectId), eq(projectMembers.userId, targetUserId)),
@@ -128,7 +132,7 @@ export async function removeProjectMember(params: {
   // A member may always remove themselves ("leave project") without
   // needing admin rights; removing someone else requires admin.
   if (actingUserId !== targetUserId) {
-    await assertCanManageMembers(projectId, project.workspaceId, actingUserId);
+    await assertCanRemoveMembers(projectId, project.workspaceId, actingUserId);
   }
 
   const target = await db.query.projectMembers.findFirst({

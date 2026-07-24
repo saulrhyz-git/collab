@@ -1,7 +1,7 @@
 import { eq } from "drizzle-orm";
 import { db } from "../db/client";
 import { tasks, taskComments, users, activityLogs } from "../db/schema";
-import { requireProjectAccess, NotFoundError } from "./tasks";
+import { requireProjectAccess, canPerform, NotFoundError } from "./tasks";
 
 export { NotFoundError };
 export class NotAuthorizedError extends Error {}
@@ -57,14 +57,13 @@ export async function deleteComment(params: { commentId: string; actingUserId: s
   if (!comment) throw new NotFoundError("Comment not found.");
 
   if (comment.authorId !== params.actingUserId) {
-    // Workspace admins/super admins can moderate; requireProjectAccess
-    // throwing here (non-member) is an acceptable side effect — it means
-    // they also can't see the task, so deleting its comment is moot.
+    // Workspace admins/super admins can moderate; a project-scoped or
+    // client-scoped custom role granting comments.delete can too — matches
+    // the new RLS task_comments_delete policy (PART 2 override).
     const task = await db.query.tasks.findFirst({ where: eq(tasks.id, comment.taskId) });
     if (!task) throw new NotFoundError("Task not found.");
-    const role = await requireProjectAccess(task.projectId, task.workspaceId, params.actingUserId);
-    if (role !== "PROJECT_ADMIN") {
-      throw new NotAuthorizedError("Only the comment's author or a project admin can delete it.");
+    if (!(await canPerform(params.actingUserId, task.projectId, "comments.delete"))) {
+      throw new NotAuthorizedError("Only the comment's author or someone with comment-moderation permission can delete it.");
     }
   }
 

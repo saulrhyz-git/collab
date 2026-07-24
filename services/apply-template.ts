@@ -7,14 +7,14 @@
  * already holds task-creation rights on that project — the same bar as
  * creating a single task by hand, since this is really just bulk task
  * creation. Mirrors project_engagement_type_write RLS exactly:
- * is_workspace_admin(workspace) OR can_perform_on_project(..., 'task.write').
+ * is_workspace_admin(workspace) OR can_perform_on_project(..., 'tasks.create').
  */
 
 import { randomUUID } from "node:crypto";
 import { eq, and } from "drizzle-orm";
 import { db } from "../db/client";
 import { tasks, projects, activityLogs, taskTemplates, engagementTypes, projectEngagementType } from "../db/schema";
-import { requireProjectAccess, canWrite, NotFoundError, NotAuthorizedError } from "./tasks";
+import { requireProjectAccess, canPerform, NotFoundError, NotAuthorizedError } from "./tasks";
 import { getTaskTemplate } from "./task-templates";
 import { getEngagementType } from "./engagement-types";
 
@@ -24,8 +24,8 @@ async function assertCanApply(projectId: string, actingUserId: string) {
   const project = await db.query.projects.findFirst({ where: eq(projects.id, projectId) });
   if (!project) throw new NotFoundError("Project not found.");
 
-  const role = await requireProjectAccess(projectId, project.workspaceId, actingUserId);
-  if (!(await canWrite(role, actingUserId))) {
+  await requireProjectAccess(projectId, project.workspaceId, actingUserId);
+  if (!(await canPerform(actingUserId, projectId, "tasks.create"))) {
     throw new NotAuthorizedError("You don't have permission to create tasks in this engagement.");
   }
   return project;

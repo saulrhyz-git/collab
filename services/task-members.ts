@@ -4,16 +4,16 @@
  * engagement's backlog. Direct (non-invite) grants for users who already
  * have an account; services/task-invitations.ts handles inviting by email.
  *
- * Mirrors task_members_insert/_delete RLS in db/rls-policies.sql (PART 2):
- * is_workspace_admin(workspace) OR has_project_permission(project,
- * 'project.manage_members') OR can_perform_on_project(..., 'task.write').
+ * Mirrors task_members_insert/_select/_delete RLS in db/rls-policies.sql
+ * (PART 2) — consolidated onto a single check: can_perform_on_project(...,
+ * 'tasks.edit'), which itself already includes the workspace-admin bypass.
  */
 
 import { eq, and } from "drizzle-orm";
 import { db } from "../db/client";
-import { taskMembers, tasks, projectMembers, workspaceMembers, users, activityLogs } from "../db/schema";
+import { taskMembers, tasks, workspaceMembers, users, activityLogs } from "../db/schema";
 import { isSuperAdmin } from "../auth/super-admin";
-import { userHasProjectPermission } from "./permissions";
+import { userCanPerformOnProject } from "./permissions";
 
 export class NotAuthorizedError extends Error {}
 export class NotFoundError extends Error {}
@@ -35,18 +35,14 @@ async function isWorkspaceAdmin(workspaceId: string, userId: string) {
 }
 
 /**
- * Anyone who could already write tasks in the project (or the workspace
+ * Anyone who could already edit tasks in the project (or the workspace
  * admin) can hand out a narrow one-task grant — sharing a single task is a
- * lighter-weight action than full task-write, so it doesn't need its own
+ * lighter-weight action than full task-editing, so it doesn't need its own
  * matrix entry.
  */
 async function assertCanManageTaskMembers(task: { projectId: string; workspaceId: string }, actingUserId: string) {
   if (await isWorkspaceAdmin(task.workspaceId, actingUserId)) return;
-  const membership = await db.query.projectMembers.findFirst({
-    where: and(eq(projectMembers.projectId, task.projectId), eq(projectMembers.userId, actingUserId)),
-  });
-  if (membership && (await userHasProjectPermission(membership.role, actingUserId, "task.write"))) return;
-  if (membership && (await userHasProjectPermission(membership.role, actingUserId, "project.manage_members"))) return;
+  if (await userCanPerformOnProject(actingUserId, task.projectId, "tasks.edit")) return;
   throw new NotAuthorizedError("You don't have permission to share this task.");
 }
 

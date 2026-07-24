@@ -4,13 +4,11 @@ import {
   tasks,
   projects,
   projectMembers,
-  workspaceMembers,
   users,
   taskDependencies,
   activityLogs,
 } from "../db/schema";
-import { isSuperAdmin } from "../auth/super-admin";
-import { userHasProjectPermission } from "./permissions";
+import { userCanAccessProject, userCanPerformOnProject } from "./permissions";
 
 export class NotAuthorizedError extends Error {}
 export class NotFoundError extends Error {}
@@ -24,35 +22,34 @@ async function getProjectOrThrow(projectId: string) {
   return project;
 }
 
-/** Exported so services/task-comments.ts and task-dependencies.ts can reuse the same access rule. */
-export async function requireProjectAccess(projectId: string, workspaceId: string, userId: string) {
-  const projectMembership = await db.query.projectMembers.findFirst({
-    where: and(eq(projectMembers.projectId, projectId), eq(projectMembers.userId, userId)),
-  });
-  if (projectMembership) return projectMembership.role;
-
-  // Full read/write access to every project, membership row or not.
-  if (await isSuperAdmin(userId)) return "PROJECT_ADMIN" as const;
-
-  const project = await db.query.projects.findFirst({ where: eq(projects.id, projectId) });
-  if (project?.visibility === "PUBLIC_TO_WORKSPACE") {
-    const wm = await db.query.workspaceMembers.findFirst({
-      where: and(eq(workspaceMembers.workspaceId, workspaceId), eq(workspaceMembers.userId, userId)),
-    });
-    if (wm) return "VIEWER" as const; // workspace members get read access to public projects
+/**
+ * Exported so services/task-comments.ts, task-dependencies.ts, and
+ * project-files.ts can reuse the same base access rule. Mirrors
+ * can_access_project() in db/rls-policies.sql (PART 2) via
+ * userCanAccessProject() — workspace owner/admin, a direct project_members
+ * row, a project-scoped custom role, or a client-scoped custom role on the
+ * project's client. Just a visibility gate; a *specific* action still needs
+ * its own canPerform() check below (a task_members-only grant, for
+ * instance, passes canPerform for its one task but not this project-wide
+ * check — see each caller for how that's layered in).
+ */
+export async function requireProjectAccess(projectId: string, _workspaceId: string, userId: string): Promise<void> {
+  if (!(await userCanAccessProject(userId, projectId))) {
+    throw new NotAuthorizedError("You don't have access to this project.");
   }
-  throw new NotAuthorizedError("You don't have access to this project.");
 }
 
 /**
- * Matrix-governed (role_permissions, key 'task.write') rather than a
- * hardcoded role check — a super admin can change what EDITOR/VIEWER can do
- * here via the permissions matrix without a code change. See
- * services/permissions.ts and the matching has_project_permission() /
- * can_perform_on_project() logic RLS independently enforces.
+ * Matrix-governed permission check for a specific aspect action (e.g.
+ * 'tasks.edit', 'comments.delete') — replaces the old single-flag
+ * canWrite()/'task.write' check. Delegates to
+ * services/permissions.ts's userCanPerformOnProject(), which (unlike the
+ * old role-string comparison this replaces) also recognizes access granted
+ * purely through a custom role or a client-wide grant, not just a built-in
+ * project_members role.
  */
-export async function canWrite(role: string | undefined, userId: string): Promise<boolean> {
-  return userHasProjectPermission(role, userId, "task.write");
+export async function canPerform(userId: string, projectId: string, key: string): Promise<boolean> {
+  return userCanPerformOnProject(userId, projectId, key);
 }
 
 /**
@@ -126,8 +123,9 @@ export async function createTask(params: {
   dueDate?: Date | null;
 }) {
   const project = await getProjectOrThrow(params.projectId);
-  const role = await requireProjectAccess(params.projectId, project.workspaceId, params.reporterId);
-  if (!(await canWrite(role, params.reporterId))) throw new NotAuthorizedError("Viewers cannot create tasks.");
+  if (!(await canPerform(params.reporterId, params.projectId, "tasks.create"))) {
+    throw new NotAuthorizedError("You don't have permission to create tasks in this engagement.");
+  }
 
   if (params.assigneeId) {
     const assigneeIsMember = await db.query.projectMembers.findFirst({
@@ -187,8 +185,9 @@ export async function moveTask(params: {
   position: number;
 }) {
   const project = await getProjectOrThrow(params.projectId);
-  const role = await requireProjectAccess(params.projectId, project.workspaceId, params.actingUserId);
-  if (!(await canWrite(role, params.actingUserId))) throw new NotAuthorizedError("Viewers cannot move tasks.");
+  if (!(await canPerform(params.actingUserId, params.projectId, "tasks.edit"))) {
+    throw new NotAuthorizedError("You don't have permission to move tasks in this engagement.");
+  }
 
   const task = await db.query.tasks.findFirst({
     where: and(eq(tasks.id, params.taskId), eq(tasks.projectId, params.projectId)),
@@ -284,8 +283,9 @@ export async function updateTask(params: {
   const task = await db.query.tasks.findFirst({ where: eq(tasks.id, params.taskId) });
   if (!task) throw new NotFoundError("Task not found.");
 
-  const role = await requireProjectAccess(task.projectId, task.workspaceId, params.actingUserId);
-  if (!(await canWrite(role, params.actingUserId))) throw new NotAuthorizedError("Viewers cannot edit tasks.");
+  if (!(await canPerform(params.actingUserId, task.projectId, "tasks.edit"))) {
+    throw new NotAuthorizedError("You don't have permission to edit tasks in this engagement.");
+  }
 
   if (params.assigneeId) {
     const assigneeIsMember = await db.query.projectMembers.findFirst({

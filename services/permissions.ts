@@ -17,7 +17,7 @@
 
 import { eq, and } from "drizzle-orm";
 import { db } from "../db/client";
-import { permissions, rolePermissions } from "../db/schema";
+import { permissions, rolePermissions, projects, projectMembers, projectCustomRoleMembers, clientMembers, workspaceMembers } from "../db/schema";
 import { isSuperAdmin } from "../auth/super-admin";
 
 export class NotAuthorizedError extends Error {}
@@ -118,6 +118,71 @@ export async function getPermissionMatrix() {
   });
 }
 
+// Fixed action order within an aspect — not every aspect has every action
+// (see db/rls-policies.sql's catalog INSERT for why each gap is deliberate:
+// no "edit a comment" feature exists, creating a brand-new engagement is a
+// workspace-scope action, etc.), so this is used to sort whatever actions
+// DO exist for an aspect rather than to force a uniform 4-column grid.
+const ACTION_ORDER = ["view", "create", "edit", "delete"];
+
+const ASPECT_LABELS: Record<string, string> = {
+  tasks: "Tasks",
+  comments: "Comments",
+  files: "Files",
+  members: "Collaborators",
+  engagement: "Engagement",
+  ai_review: "AI Review",
+};
+
+/**
+ * The PROJECT-scope permission catalog grouped into one row per aspect
+ * (tasks/comments/files/members/engagement/ai_review), each with its
+ * available actions in view→create→edit→delete order — this is what the
+ * custom-role create/edit dialog renders as its inline tickbox grid.
+ * CLIENT-scoped custom roles use this exact same catalog (see the
+ * getPermissionMatrix comment above for why) — the caller decides where the
+ * grant is stored (scope='PROJECT' vs scope='CLIENT'), not this function.
+ */
+export async function getProjectPermissionCatalogByAspect() {
+  const catalog = await db.query.permissions.findMany({
+    where: eq(permissions.scope, "PROJECT"),
+  });
+
+  const byAspect = new Map<string, typeof catalog>();
+  for (const p of catalog) {
+    const aspect = p.key.split(".")[0];
+    if (!byAspect.has(aspect)) byAspect.set(aspect, []);
+    byAspect.get(aspect)!.push(p);
+  }
+
+  return Array.from(byAspect.entries())
+    .sort(([a], [b]) => ACTION_ORDER_ASPECTS_INDEX(a) - ACTION_ORDER_ASPECTS_INDEX(b))
+    .map(([aspect, perms]) => ({
+      aspect,
+      label: ASPECT_LABELS[aspect] ?? aspect,
+      actions: perms
+        .slice()
+        .sort((a, b) => {
+          const actionOf = (key: string) => key.split(".")[1] ?? "";
+          return ACTION_ORDER.indexOf(actionOf(a.key)) - ACTION_ORDER.indexOf(actionOf(b.key));
+        })
+        .map((p) => ({
+          key: p.key,
+          action: p.key.split(".")[1] ?? "",
+          label: p.label,
+          description: p.description,
+        })),
+    }));
+}
+
+// Stable display order for aspect rows themselves — matches the order
+// they're inserted in db/rls-policies.sql's catalog.
+const ASPECT_ORDER = ["tasks", "comments", "files", "members", "engagement", "ai_review"];
+function ACTION_ORDER_ASPECTS_INDEX(aspect: string): number {
+  const i = ASPECT_ORDER.indexOf(aspect);
+  return i === -1 ? ASPECT_ORDER.length : i;
+}
+
 /** Superadmin-only: toggle a single (scope, role, permission) cell. */
 export async function setRolePermission(params: {
   scope: Scope;
@@ -198,4 +263,102 @@ export async function userHasCustomRolePermission(
 ): Promise<boolean> {
   if (await isSuperAdmin(userId)) return true;
   return roleHasPermission(customRoleScope, customRoleId, key);
+}
+
+/**
+ * The single, authoritative app-layer "can this user do X on this
+ * engagement" check — mirrors can_perform_on_project() in
+ * db/rls-policies.sql (PART 2) exactly: workspace owner/admin oversight, OR
+ * their built-in project_members role, OR ANY PROJECT-scoped custom role
+ * they hold on this project, OR ANY CLIENT-scoped custom role they hold on
+ * the project's client (grants apply across every one of that client's
+ * engagements). A user can hold multiple custom roles at once — this
+ * returns true if ANY of them grant `key` (OR across roles), same as RLS.
+ *
+ * Superseded services/tasks.ts's old canWrite()/requireProjectAccess()
+ * pattern, which only ever consulted a single built-in project_members
+ * role and so couldn't recognize access granted purely through a custom
+ * role or a client-wide grant. Every service gating a PROJECT-scope aspect
+ * action (tasks/comments/files/members/engagement/ai_review) should call
+ * this rather than re-deriving a "role" and checking it in isolation.
+ */
+export async function userCanPerformOnProject(userId: string, projectId: string, key: string): Promise<boolean> {
+  if (await isSuperAdmin(userId)) return true;
+
+  const project = await db.query.projects.findFirst({
+    where: eq(projects.id, projectId),
+    columns: { workspaceId: true, clientId: true },
+  });
+  if (!project) return false;
+
+  const workspaceMembership = await db.query.workspaceMembers.findFirst({
+    where: and(eq(workspaceMembers.workspaceId, project.workspaceId), eq(workspaceMembers.userId, userId)),
+  });
+  if (workspaceMembership?.role === "OWNER" || workspaceMembership?.role === "ADMIN") return true;
+
+  const [builtinMembership, customRoleMemberships, clientMemberships] = await Promise.all([
+    db.query.projectMembers.findFirst({
+      where: and(eq(projectMembers.projectId, projectId), eq(projectMembers.userId, userId)),
+    }),
+    db.query.projectCustomRoleMembers.findMany({
+      where: and(eq(projectCustomRoleMembers.projectId, projectId), eq(projectCustomRoleMembers.userId, userId)),
+    }),
+    project.clientId
+      ? db.query.clientMembers.findMany({
+          where: and(eq(clientMembers.clientId, project.clientId), eq(clientMembers.userId, userId)),
+        })
+      : Promise.resolve([]),
+  ]);
+
+  if (builtinMembership && (await roleHasPermission("PROJECT", builtinMembership.role, key))) return true;
+  for (const m of customRoleMemberships) {
+    if (await roleHasPermission("PROJECT", m.customRoleId, key)) return true;
+  }
+  for (const m of clientMemberships) {
+    if (await roleHasPermission("CLIENT", m.customRoleId, key)) return true;
+  }
+  return false;
+}
+
+/**
+ * Does this user have ANY access to this engagement at all — mirrors
+ * can_access_project() in db/rls-policies.sql (PART 2): workspace
+ * owner/admin, a direct project_members row, any project-scoped custom
+ * role, or any client-scoped custom role on the project's client.
+ * Unlike userCanPerformOnProject, this doesn't check a specific
+ * permission — it's the "can they see this engagement exists at all" gate
+ * lower-level helpers (like requiring existence before a 404 check) need.
+ */
+export async function userCanAccessProject(userId: string, projectId: string): Promise<boolean> {
+  if (await isSuperAdmin(userId)) return true;
+
+  const project = await db.query.projects.findFirst({
+    where: eq(projects.id, projectId),
+    columns: { workspaceId: true, clientId: true },
+  });
+  if (!project) return false;
+
+  const workspaceMembership = await db.query.workspaceMembers.findFirst({
+    where: and(eq(workspaceMembers.workspaceId, project.workspaceId), eq(workspaceMembers.userId, userId)),
+  });
+  if (workspaceMembership?.role === "OWNER" || workspaceMembership?.role === "ADMIN") return true;
+
+  const builtinMembership = await db.query.projectMembers.findFirst({
+    where: and(eq(projectMembers.projectId, projectId), eq(projectMembers.userId, userId)),
+  });
+  if (builtinMembership) return true;
+
+  const customRoleMembership = await db.query.projectCustomRoleMembers.findFirst({
+    where: and(eq(projectCustomRoleMembers.projectId, projectId), eq(projectCustomRoleMembers.userId, userId)),
+  });
+  if (customRoleMembership) return true;
+
+  if (project.clientId) {
+    const clientMembership = await db.query.clientMembers.findFirst({
+      where: and(eq(clientMembers.clientId, project.clientId), eq(clientMembers.userId, userId)),
+    });
+    if (clientMembership) return true;
+  }
+
+  return false;
 }

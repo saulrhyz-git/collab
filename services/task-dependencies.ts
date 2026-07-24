@@ -1,7 +1,7 @@
 import { eq } from "drizzle-orm";
 import { db } from "../db/client";
 import { tasks, taskDependencies } from "../db/schema";
-import { requireProjectAccess, canWrite, NotFoundError, NotAuthorizedError } from "./tasks";
+import { requireProjectAccess, canPerform, NotFoundError, NotAuthorizedError } from "./tasks";
 
 export { NotFoundError, NotAuthorizedError };
 export class CyclicDependencyError extends Error {}
@@ -56,8 +56,9 @@ export async function addDependency(params: {
     throw new NotAuthorizedError("Both tasks must be in the same project.");
   }
 
-  const role = await requireProjectAccess(successor.projectId, successor.workspaceId, params.actingUserId);
-  if (!(await canWrite(role, params.actingUserId))) throw new NotAuthorizedError("Viewers cannot add dependencies.");
+  if (!(await canPerform(params.actingUserId, successor.projectId, "tasks.edit"))) {
+    throw new NotAuthorizedError("You don't have permission to add dependencies in this engagement.");
+  }
 
   if (await wouldCreateCycle(successor.projectId, params.predecessorTaskId, params.successorTaskId)) {
     throw new CyclicDependencyError("This would create a circular dependency.");
@@ -83,8 +84,9 @@ export async function removeDependency(params: { dependencyId: string; actingUse
   const successor = await db.query.tasks.findFirst({ where: eq(tasks.id, dep.successorTaskId) });
   if (!successor) throw new NotFoundError("Task not found.");
 
-  const role = await requireProjectAccess(successor.projectId, successor.workspaceId, params.actingUserId);
-  if (!(await canWrite(role, params.actingUserId))) throw new NotAuthorizedError("Viewers cannot remove dependencies.");
+  if (!(await canPerform(params.actingUserId, successor.projectId, "tasks.edit"))) {
+    throw new NotAuthorizedError("You don't have permission to remove dependencies in this engagement.");
+  }
 
   await db.delete(taskDependencies).where(eq(taskDependencies.id, params.dependencyId));
 }

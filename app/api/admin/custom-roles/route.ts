@@ -16,6 +16,10 @@ const createSchema = z.object({
   name: z.string().min(1).max(100),
   scope: z.enum(["PROJECT", "CLIENT"]),
   description: z.string().optional(),
+  // Aspect x action keys ticked in the create dialog's inline permission
+  // grid (e.g. "tasks.edit", "files.delete") — granted immediately as part
+  // of role creation, not as a separate follow-up step on another page.
+  grantedKeys: z.array(z.string().min(1).max(100)).optional(),
 });
 
 export const GET = withAuth(async (req) => {

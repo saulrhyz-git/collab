@@ -7,15 +7,19 @@
 import { NextResponse } from "next/server";
 import { z } from "zod";
 import { withAuth } from "../../../../../auth/require-user";
-import { deleteCustomRole, getCustomRole, updateCustomRole } from "../../../../../services/custom-roles";
+import { deleteCustomRole, getCustomRoleWithGrants, updateCustomRole } from "../../../../../services/custom-roles";
 
 const updateSchema = z.object({
   name: z.string().min(1).max(100).optional(),
   description: z.string().nullable().optional(),
+  // When present, fully replaces the role's grants (see
+  // services/custom-roles.ts's syncCustomRoleGrants) — the edit dialog's
+  // tickbox grid always submits the complete current selection, not a diff.
+  grantedKeys: z.array(z.string().min(1).max(100)).optional(),
 });
 
 export const GET = withAuth(async (_req, _userId, params) => {
-  const role = await getCustomRole(params.customRoleId);
+  const role = await getCustomRoleWithGrants(params.customRoleId);
   return NextResponse.json(role);
 });
 
@@ -24,7 +28,8 @@ export const PATCH = withAuth(async (req, userId, params) => {
   if (!parsed.success) {
     return NextResponse.json({ error: parsed.error.flatten() }, { status: 400 });
   }
-  const role = await updateCustomRole({ customRoleId: params.customRoleId, actingUserId: userId, ...parsed.data });
+  await updateCustomRole({ customRoleId: params.customRoleId, actingUserId: userId, ...parsed.data });
+  const role = await getCustomRoleWithGrants(params.customRoleId);
   return NextResponse.json(role);
 });
 

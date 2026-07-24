@@ -380,12 +380,21 @@ CREATE POLICY projects_update ON projects
   FOR UPDATE USING (
     is_workspace_admin(workspace_id)
     OR has_workspace_permission(workspace_id, 'project.manage')
-    OR has_project_permission(id, 'project.edit')
+    OR has_project_permission(id, 'engagement.edit')
   );
 
 DROP POLICY IF EXISTS projects_delete ON projects;
 CREATE POLICY projects_delete ON projects
-  FOR DELETE USING (is_workspace_admin(workspace_id) OR has_workspace_permission(workspace_id, 'project.manage'));
+  FOR DELETE USING (
+    is_workspace_admin(workspace_id)
+    OR has_workspace_permission(workspace_id, 'project.manage')
+    -- A PROJECT_ADMIN (or custom role holding engagement.delete) can now
+    -- archive the one engagement they administer, without needing the
+    -- broader workspace-level project.manage permission — a gap in the
+    -- original design (only workspace admin/permission could ever archive
+    -- a project, even one you were PROJECT_ADMIN on).
+    OR has_project_permission(id, 'engagement.delete')
+  );
 
 -- ---------------------------------------------------------------------------
 -- project_members
@@ -404,17 +413,22 @@ ALTER TABLE project_members FORCE ROW LEVEL SECURITY;
 DROP POLICY IF EXISTS project_members_select ON project_members;
 CREATE POLICY project_members_select ON project_members
   FOR SELECT USING (
-    is_project_member(project_id)
-    OR is_workspace_admin(project_workspace_id(project_id))
+    is_workspace_admin(project_workspace_id(project_id))
+    OR user_id = current_app_user_id() -- always see your own membership row
+    OR can_perform_on_project(
+      project_id, project_workspace_id(project_id),
+      (SELECT p.visibility FROM projects p WHERE p.id = project_id),
+      'members.view'
+    )
   );
 
 DROP POLICY IF EXISTS project_members_insert ON project_members;
 CREATE POLICY project_members_insert ON project_members
   FOR INSERT WITH CHECK (
     is_workspace_admin(project_workspace_id(project_id))
-    -- Matrix-governed: whoever holds 'project.manage_members' (PROJECT_ADMIN
-    -- by default) can add members — replaces the old hardcoded role check.
-    OR has_project_permission(project_id, 'project.manage_members')
+    -- Matrix-governed: whoever holds 'members.create' (PROJECT_ADMIN by
+    -- default) can add members — replaces the old hardcoded role check.
+    OR has_project_permission(project_id, 'members.create')
     -- Bootstrap: the project's own creator may insert their first
     -- (PROJECT_ADMIN) membership row immediately after creating it — same
     -- shape as workspace_members_insert's OWNER bootstrap branch, and
@@ -443,7 +457,19 @@ CREATE POLICY project_members_delete ON project_members
   FOR DELETE USING (
     user_id = current_app_user_id() -- self-removal
     OR is_workspace_admin(project_workspace_id(project_id))
-    OR has_project_permission(project_id, 'project.manage_members')
+    OR has_project_permission(project_id, 'members.delete')
+  );
+
+-- Fixes a pre-existing gap: there was never an UPDATE policy on
+-- project_members at all, so services/project-members.ts's
+-- updateProjectMemberRole (changing someone's role) would have failed
+-- under FORCE ROW LEVEL SECURITY's default-deny — masked because it was
+-- never exercised by an ordinary (non-superadmin) account in prior testing.
+DROP POLICY IF EXISTS project_members_update ON project_members;
+CREATE POLICY project_members_update ON project_members
+  FOR UPDATE USING (
+    is_workspace_admin(project_workspace_id(project_id))
+    OR has_project_permission(project_id, 'members.edit')
   );
 
 -- ---------------------------------------------------------------------------
@@ -481,6 +507,16 @@ CREATE POLICY project_invitations_update ON project_invitations
 
 -- ---------------------------------------------------------------------------
 -- tasks
+--
+-- NOTE: tasks_select/tasks_write (defined here using the pre-aspect-model
+-- 'task.write'/'task.comment' keys) are superseded further down, in PART 2,
+-- by tasks_select/tasks_insert/tasks_update/tasks_delete and
+-- task_comments_select/insert/delete using the current tasks.*/comments.*
+-- keys — PART 2 runs later in this same script, so its versions are what
+-- actually ends up live. Left here (rather than deleted) so ALTER TABLE ...
+-- ENABLE ROW LEVEL SECURITY always has at least one policy in place for the
+-- brief window between this file starting and PART 2 finishing, on a
+-- from-scratch run.
 -- ---------------------------------------------------------------------------
 ALTER TABLE tasks ENABLE ROW LEVEL SECURITY;
 ALTER TABLE tasks FORCE ROW LEVEL SECURITY;
@@ -623,24 +659,76 @@ CREATE POLICY role_permissions_write ON role_permissions
 
 -- Permission catalog. ON CONFLICT DO NOTHING keeps this re-runnable without
 -- clobbering rows a future migration might add columns to.
+--
+-- The PROJECT-scope rows below are named `<aspect>.<action>` — a clean
+-- aspect x action grid (Tasks/Comments/Files/Members/Engagement/AI Review,
+-- each with whichever of View/Create/Edit/Delete genuinely applies) rather
+-- than the earlier ad-hoc key-per-feature list (task.write, file.manage,
+-- etc.). This is what both the /admin/permissions matrix and a custom
+-- role's inline tickbox grid (/admin/custom-roles) render — the same keys
+-- are reused for CLIENT-scoped custom roles too (see role_permissions rows
+-- with scope='CLIENT' below), applying the same grants across every one of
+-- a client's engagements at once instead of just one.
+--
+-- Some cells are deliberately omitted rather than included-but-meaningless:
+-- Comments has no Edit (nothing lets anyone edit someone else's comment;
+-- editing your own is never permission-gated), Engagement has no Create
+-- (creating a NEW engagement is the workspace-scope project.create, above —
+-- a role scoped to one already-existing engagement can't "create" it), and
+-- AI Review has only View/Create (there's no edit/delete-a-review action).
+--
+-- The DELETE below removes the old ad-hoc keys this replaces — plain
+-- ON CONFLICT DO NOTHING would leave them behind as orphaned rows nothing
+-- reads anymore.
+DELETE FROM role_permissions WHERE permission_key IN (
+  'task.write', 'task.comment', 'project.edit', 'project.manage_members', 'file.upload', 'file.manage', 'ai_review.run'
+);
+DELETE FROM permissions WHERE key IN (
+  'task.write', 'task.comment', 'project.edit', 'project.manage_members', 'file.upload', 'file.manage', 'ai_review.run'
+);
+
 INSERT INTO permissions (key, label, scope, description) VALUES
   ('client.create', 'Create clients', 'WORKSPACE', 'Add a new client to the workspace.'),
   ('client.manage', 'Manage any client', 'WORKSPACE', 'Edit or archive clients you did not create yourself.'),
   ('project.create', 'Create engagements', 'WORKSPACE', 'Create a new project/engagement in the workspace.'),
   ('project.manage', 'Manage any engagement', 'WORKSPACE', 'Edit, archive, or delete any project in the workspace, regardless of project-level membership.'),
   ('workspace.manage_members', 'Manage workspace members', 'WORKSPACE', 'Invite, remove, or change the role of workspace members.'),
-  ('task.write', 'Create & edit tasks', 'PROJECT', 'Create, edit, move, or delete tasks and their dependencies.'),
-  ('task.comment', 'Comment on tasks', 'PROJECT', 'Post comments on tasks.'),
-  ('project.edit', 'Edit engagement details', 'PROJECT', 'Edit this project''s name, description, visibility, and client.'),
-  ('project.manage_members', 'Manage engagement members', 'PROJECT', 'Invite, remove, or change the role of this project''s members.'),
-  ('file.upload', 'Upload reference files', 'PROJECT', 'Upload files to this engagement''s References tab.'),
-  ('file.manage', 'Manage any file', 'PROJECT', 'Delete files uploaded by other people.'),
-  ('ai_review.run', 'Run AI document review', 'PROJECT', 'Submit a document for AI-assisted review.')
+
+  ('tasks.view',   'View tasks',   'PROJECT', 'See this engagement''s tasks and their details.'),
+  ('tasks.create', 'Create tasks', 'PROJECT', 'Add new tasks, including via applying a task template.'),
+  ('tasks.edit',   'Edit tasks',   'PROJECT', 'Edit, move, reassign tasks, and manage their dependencies.'),
+  ('tasks.delete', 'Delete tasks', 'PROJECT', 'Delete tasks from this engagement.'),
+
+  ('comments.view',   'View comments',       'PROJECT', 'See comments posted on tasks.'),
+  ('comments.create', 'Post comments',       'PROJECT', 'Comment on tasks.'),
+  ('comments.delete', 'Delete any comment',  'PROJECT', 'Delete comments posted by other people (you can always delete your own).'),
+
+  ('files.view',   'View files',   'PROJECT', 'See the References tab and uploaded files.'),
+  ('files.create', 'Upload files', 'PROJECT', 'Upload new files, to References or for AI review.'),
+  ('files.edit',   'Edit files',   'PROJECT', 'Recategorize a file, e.g. promote an AI-reviewed document to References.'),
+  ('files.delete', 'Delete files', 'PROJECT', 'Delete files uploaded by other people (you can always delete your own).'),
+
+  ('members.view',   'View collaborators',            'PROJECT', 'See this engagement''s member roster.'),
+  ('members.create', 'Add collaborators',              'PROJECT', 'Invite or add people to this engagement.'),
+  ('members.edit',   'Change collaborator roles',       'PROJECT', 'Change an existing collaborator''s role.'),
+  ('members.delete', 'Remove collaborators',            'PROJECT', 'Remove people from this engagement.'),
+
+  ('engagement.view',   'View engagement details', 'PROJECT', 'See this engagement''s name, description, and settings.'),
+  ('engagement.edit',   'Edit engagement details', 'PROJECT', 'Edit this engagement''s name, description, visibility, and client.'),
+  ('engagement.delete', 'Delete engagement',       'PROJECT', 'Archive this engagement.'),
+
+  ('ai_review.view',   'View AI reviews', 'PROJECT', 'See past AI review summaries.'),
+  ('ai_review.create', 'Run AI review',   'PROJECT', 'Submit a document for AI-assisted review.')
 ON CONFLICT (key) DO NOTHING;
 
--- Default grants — chosen to reproduce exactly what was hardcoded before
--- this matrix existed, so installing it changes nothing until a super admin
--- actually edits a tickbox.
+-- Default grants for the built-in roles — chosen to reproduce what the
+-- old, single-flag-per-feature keys granted (PROJECT_ADMIN/EDITOR both held
+-- task.write/file.upload/ai_review.run; only PROJECT_ADMIN held
+-- project.edit/project.manage_members/file.manage), so installing this
+-- rework changes nothing for the built-ins until a super admin edits a
+-- tickbox. View-type keys default true for every role since visibility was
+-- previously ungated by the matrix at all (any project member could see
+-- tasks/comments/files/the roster/engagement details regardless of role).
 INSERT INTO role_permissions (scope, role, permission_key, granted) VALUES
   ('WORKSPACE', 'OWNER',  'client.create', true),
   ('WORKSPACE', 'ADMIN',  'client.create', true),
@@ -662,27 +750,72 @@ INSERT INTO role_permissions (scope, role, permission_key, granted) VALUES
   ('WORKSPACE', 'ADMIN',  'workspace.manage_members', true),
   ('WORKSPACE', 'MEMBER', 'workspace.manage_members', false),
   ('WORKSPACE', 'GUEST',  'workspace.manage_members', false),
-  ('PROJECT', 'PROJECT_ADMIN', 'task.write', true),
-  ('PROJECT', 'EDITOR',        'task.write', true),
-  ('PROJECT', 'VIEWER',        'task.write', false),
-  ('PROJECT', 'PROJECT_ADMIN', 'task.comment', true),
-  ('PROJECT', 'EDITOR',        'task.comment', true),
-  ('PROJECT', 'VIEWER',        'task.comment', true),
-  ('PROJECT', 'PROJECT_ADMIN', 'project.edit', true),
-  ('PROJECT', 'EDITOR',        'project.edit', false),
-  ('PROJECT', 'VIEWER',        'project.edit', false),
-  ('PROJECT', 'PROJECT_ADMIN', 'project.manage_members', true),
-  ('PROJECT', 'EDITOR',        'project.manage_members', false),
-  ('PROJECT', 'VIEWER',        'project.manage_members', false),
-  ('PROJECT', 'PROJECT_ADMIN', 'file.upload', true),
-  ('PROJECT', 'EDITOR',        'file.upload', true),
-  ('PROJECT', 'VIEWER',        'file.upload', false),
-  ('PROJECT', 'PROJECT_ADMIN', 'file.manage', true),
-  ('PROJECT', 'EDITOR',        'file.manage', false),
-  ('PROJECT', 'VIEWER',        'file.manage', false),
-  ('PROJECT', 'PROJECT_ADMIN', 'ai_review.run', true),
-  ('PROJECT', 'EDITOR',        'ai_review.run', true),
-  ('PROJECT', 'VIEWER',        'ai_review.run', false)
+
+  ('PROJECT', 'PROJECT_ADMIN', 'tasks.view',   true),
+  ('PROJECT', 'EDITOR',        'tasks.view',   true),
+  ('PROJECT', 'VIEWER',        'tasks.view',   true),
+  ('PROJECT', 'PROJECT_ADMIN', 'tasks.create', true),
+  ('PROJECT', 'EDITOR',        'tasks.create', true),
+  ('PROJECT', 'VIEWER',        'tasks.create', false),
+  ('PROJECT', 'PROJECT_ADMIN', 'tasks.edit',   true),
+  ('PROJECT', 'EDITOR',        'tasks.edit',   true),
+  ('PROJECT', 'VIEWER',        'tasks.edit',   false),
+  ('PROJECT', 'PROJECT_ADMIN', 'tasks.delete', true),
+  ('PROJECT', 'EDITOR',        'tasks.delete', true),
+  ('PROJECT', 'VIEWER',        'tasks.delete', false),
+
+  ('PROJECT', 'PROJECT_ADMIN', 'comments.view',   true),
+  ('PROJECT', 'EDITOR',        'comments.view',   true),
+  ('PROJECT', 'VIEWER',        'comments.view',   true),
+  ('PROJECT', 'PROJECT_ADMIN', 'comments.create', true),
+  ('PROJECT', 'EDITOR',        'comments.create', true),
+  ('PROJECT', 'VIEWER',        'comments.create', true),
+  ('PROJECT', 'PROJECT_ADMIN', 'comments.delete', true),
+  ('PROJECT', 'EDITOR',        'comments.delete', false),
+  ('PROJECT', 'VIEWER',        'comments.delete', false),
+
+  ('PROJECT', 'PROJECT_ADMIN', 'files.view',   true),
+  ('PROJECT', 'EDITOR',        'files.view',   true),
+  ('PROJECT', 'VIEWER',        'files.view',   true),
+  ('PROJECT', 'PROJECT_ADMIN', 'files.create', true),
+  ('PROJECT', 'EDITOR',        'files.create', true),
+  ('PROJECT', 'VIEWER',        'files.create', false),
+  ('PROJECT', 'PROJECT_ADMIN', 'files.edit',   true),
+  ('PROJECT', 'EDITOR',        'files.edit',   true),
+  ('PROJECT', 'VIEWER',        'files.edit',   false),
+  ('PROJECT', 'PROJECT_ADMIN', 'files.delete', true),
+  ('PROJECT', 'EDITOR',        'files.delete', false),
+  ('PROJECT', 'VIEWER',        'files.delete', false),
+
+  ('PROJECT', 'PROJECT_ADMIN', 'members.view',   true),
+  ('PROJECT', 'EDITOR',        'members.view',   true),
+  ('PROJECT', 'VIEWER',        'members.view',   true),
+  ('PROJECT', 'PROJECT_ADMIN', 'members.create', true),
+  ('PROJECT', 'EDITOR',        'members.create', false),
+  ('PROJECT', 'VIEWER',        'members.create', false),
+  ('PROJECT', 'PROJECT_ADMIN', 'members.edit',   true),
+  ('PROJECT', 'EDITOR',        'members.edit',   false),
+  ('PROJECT', 'VIEWER',        'members.edit',   false),
+  ('PROJECT', 'PROJECT_ADMIN', 'members.delete', true),
+  ('PROJECT', 'EDITOR',        'members.delete', false),
+  ('PROJECT', 'VIEWER',        'members.delete', false),
+
+  ('PROJECT', 'PROJECT_ADMIN', 'engagement.view',   true),
+  ('PROJECT', 'EDITOR',        'engagement.view',   true),
+  ('PROJECT', 'VIEWER',        'engagement.view',   true),
+  ('PROJECT', 'PROJECT_ADMIN', 'engagement.edit',   true),
+  ('PROJECT', 'EDITOR',        'engagement.edit',   false),
+  ('PROJECT', 'VIEWER',        'engagement.edit',   false),
+  ('PROJECT', 'PROJECT_ADMIN', 'engagement.delete', true),
+  ('PROJECT', 'EDITOR',        'engagement.delete', false),
+  ('PROJECT', 'VIEWER',        'engagement.delete', false),
+
+  ('PROJECT', 'PROJECT_ADMIN', 'ai_review.view',   true),
+  ('PROJECT', 'EDITOR',        'ai_review.view',   true),
+  ('PROJECT', 'VIEWER',        'ai_review.view',   true),
+  ('PROJECT', 'PROJECT_ADMIN', 'ai_review.create', true),
+  ('PROJECT', 'EDITOR',        'ai_review.create', true),
+  ('PROJECT', 'VIEWER',        'ai_review.create', false)
 ON CONFLICT (scope, role, permission_key) DO NOTHING;
 
 -- ---------------------------------------------------------------------------
@@ -740,7 +873,7 @@ CREATE POLICY engagement_type_templates_write ON engagement_type_templates
 -- project_engagement_type — which engagement type (if any) a project was
 -- created from. Visibility follows the project itself; writing it is really
 -- just "creating tasks in bulk" (a template application), so it's gated the
--- same way task.write is.
+-- same way tasks.create is.
 ALTER TABLE project_engagement_type ENABLE ROW LEVEL SECURITY;
 ALTER TABLE project_engagement_type FORCE ROW LEVEL SECURITY;
 
@@ -756,7 +889,7 @@ CREATE POLICY project_engagement_type_write ON project_engagement_type
     EXISTS (
       SELECT 1 FROM projects p
       WHERE p.id = project_id
-        AND (is_workspace_admin(p.workspace_id) OR can_perform_on_project(p.id, p.workspace_id, p.visibility, 'task.write'))
+        AND (is_workspace_admin(p.workspace_id) OR can_perform_on_project(p.id, p.workspace_id, p.visibility, 'tasks.create'))
     )
   );
 
@@ -794,8 +927,9 @@ CREATE POLICY ai_provider_settings_write ON ai_provider_settings
 
 -- ---------------------------------------------------------------------------
 -- project_files — References tab + AI-reviewed documents. Read follows plain
--- project visibility; upload is gated by file.upload; delete by the
--- uploader themselves, file.manage, or workspace admin.
+-- project visibility; upload is gated by files.create; recategorizing
+-- (the "Add to References" promote action) by files.edit; delete by the
+-- uploader themselves, files.delete, or workspace admin.
 -- ---------------------------------------------------------------------------
 ALTER TABLE project_files ENABLE ROW LEVEL SECURITY;
 ALTER TABLE project_files FORCE ROW LEVEL SECURITY;
@@ -803,7 +937,7 @@ ALTER TABLE project_files FORCE ROW LEVEL SECURITY;
 DROP POLICY IF EXISTS project_files_select ON project_files;
 CREATE POLICY project_files_select ON project_files
   FOR SELECT USING (
-    EXISTS (SELECT 1 FROM projects p WHERE p.id = project_id AND can_access_project(p.id, p.workspace_id, p.visibility))
+    EXISTS (SELECT 1 FROM projects p WHERE p.id = project_id AND can_perform_on_project(p.id, p.workspace_id, p.visibility, 'files.view'))
   );
 
 DROP POLICY IF EXISTS project_files_insert ON project_files;
@@ -813,7 +947,22 @@ CREATE POLICY project_files_insert ON project_files
     AND EXISTS (
       SELECT 1 FROM projects p
       WHERE p.id = project_id
-        AND (is_workspace_admin(p.workspace_id) OR can_perform_on_project(p.id, p.workspace_id, p.visibility, 'file.upload'))
+        AND (is_workspace_admin(p.workspace_id) OR can_perform_on_project(p.id, p.workspace_id, p.visibility, 'files.create'))
+    )
+  );
+
+-- Fixes a pre-existing gap: there was never an UPDATE policy on
+-- project_files at all, so services/project-files.ts's
+-- promoteFileToReferences (flipping AI_REVIEWED -> REFERENCE) would have
+-- failed under FORCE ROW LEVEL SECURITY's default-deny.
+DROP POLICY IF EXISTS project_files_update ON project_files;
+CREATE POLICY project_files_update ON project_files
+  FOR UPDATE USING (
+    uploaded_by = current_app_user_id()
+    OR EXISTS (
+      SELECT 1 FROM projects p
+      WHERE p.id = project_id
+        AND (is_workspace_admin(p.workspace_id) OR can_perform_on_project(p.id, p.workspace_id, p.visibility, 'files.edit'))
     )
   );
 
@@ -824,7 +973,7 @@ CREATE POLICY project_files_delete ON project_files
     OR EXISTS (
       SELECT 1 FROM projects p
       WHERE p.id = project_id
-        AND (is_workspace_admin(p.workspace_id) OR can_perform_on_project(p.id, p.workspace_id, p.visibility, 'file.manage'))
+        AND (is_workspace_admin(p.workspace_id) OR can_perform_on_project(p.id, p.workspace_id, p.visibility, 'files.delete'))
     )
   );
 
@@ -1017,33 +1166,70 @@ CREATE POLICY clients_select ON clients
     OR is_client_member(id)
   );
 
--- tasks_select / tasks_write: add the task_members narrow-ACL branch on top
--- of the (already reworked, via can_access_project) engagement-level check.
+-- tasks_select: add the task_members narrow-ACL branch on top of the
+-- (already reworked, via can_access_project) engagement-level check, now
+-- additionally gated by the tasks.view permission for anyone reaching it
+-- through project-level access (a task_members grant bypasses this — its
+-- own VIEWER/EDITOR levels aren't matrix-governed, see task_members'
+-- schema comment).
+-- can_perform_on_project's own EXISTS already implies project access (via
+-- whichever path grants the permission), so it's sufficient on its own —
+-- no need to separately AND can_access_project().
 DROP POLICY IF EXISTS tasks_select ON tasks;
 CREATE POLICY tasks_select ON tasks
   FOR SELECT USING (
     is_task_member(id)
     OR EXISTS (
       SELECT 1 FROM projects p
-      WHERE p.id = project_id AND can_access_project(p.id, p.workspace_id, p.visibility)
+      WHERE p.id = project_id AND can_perform_on_project(p.id, p.workspace_id, p.visibility, 'tasks.view')
     )
   );
 
+-- tasks writes are split by statement type (a single FOR ALL policy can't
+-- check a different permission key per action) so tasks.create/edit/delete
+-- each gate their own operation instead of one blanket "task.write".
 DROP POLICY IF EXISTS tasks_write ON tasks;
-CREATE POLICY tasks_write ON tasks
-  FOR ALL USING (
+
+DROP POLICY IF EXISTS tasks_insert ON tasks;
+CREATE POLICY tasks_insert ON tasks
+  FOR INSERT WITH CHECK (
+    is_workspace_admin(workspace_id)
+    OR can_perform_on_project(
+      project_id, workspace_id,
+      (SELECT p.visibility FROM projects p WHERE p.id = project_id),
+      'tasks.create'
+    )
+  );
+
+DROP POLICY IF EXISTS tasks_update ON tasks;
+CREATE POLICY tasks_update ON tasks
+  FOR UPDATE USING (
     is_workspace_admin(workspace_id)
     OR has_task_edit_permission(id)
     OR can_perform_on_project(
-      project_id,
-      workspace_id,
+      project_id, workspace_id,
       (SELECT p.visibility FROM projects p WHERE p.id = project_id),
-      'task.write'
+      'tasks.edit'
+    )
+  );
+
+DROP POLICY IF EXISTS tasks_delete ON tasks;
+CREATE POLICY tasks_delete ON tasks
+  FOR DELETE USING (
+    is_workspace_admin(workspace_id)
+    OR can_perform_on_project(
+      project_id, workspace_id,
+      (SELECT p.visibility FROM projects p WHERE p.id = project_id),
+      'tasks.delete'
     )
   );
 
 -- task_comments: a task_members grant (VIEWER or EDITOR) can read and post
 -- comments on that one task, same latitude VIEWER-role project members get.
+-- can_perform_on_project's own EXISTS already requires the row-existence
+-- checks can_access_project would add on top (project membership / custom
+-- role / client membership, whichever path grants the permission) — no
+-- need to AND them together.
 DROP POLICY IF EXISTS task_comments_select ON task_comments;
 CREATE POLICY task_comments_select ON task_comments
   FOR SELECT USING (
@@ -1051,7 +1237,7 @@ CREATE POLICY task_comments_select ON task_comments
     OR EXISTS (
       SELECT 1 FROM tasks t
       JOIN projects p ON p.id = t.project_id
-      WHERE t.id = task_id AND can_access_project(p.id, p.workspace_id, p.visibility)
+      WHERE t.id = task_id AND can_perform_on_project(p.id, p.workspace_id, p.visibility, 'comments.view')
     )
   );
 
@@ -1064,13 +1250,28 @@ CREATE POLICY task_comments_insert ON task_comments
       OR EXISTS (
         SELECT 1 FROM tasks t
         JOIN projects p ON p.id = t.project_id
-        WHERE t.id = task_id AND can_perform_on_project(p.id, p.workspace_id, p.visibility, 'task.comment')
+        WHERE t.id = task_id AND can_perform_on_project(p.id, p.workspace_id, p.visibility, 'comments.create')
       )
+    )
+  );
+
+DROP POLICY IF EXISTS task_comments_delete ON task_comments;
+CREATE POLICY task_comments_delete ON task_comments
+  FOR DELETE USING (
+    author_id = current_app_user_id() -- you can always delete your own
+    OR EXISTS (
+      SELECT 1 FROM tasks t
+      JOIN projects p ON p.id = t.project_id
+      WHERE t.id = task_id
+        AND (is_workspace_admin(t.workspace_id) OR can_perform_on_project(p.id, p.workspace_id, p.visibility, 'comments.delete'))
     )
   );
 
 -- task_dependencies: a task_members grant on the successor task lets that
 -- collaborator see the dependency; editing it requires the EDITOR level.
+-- Kept as a single FOR ALL (add/remove a dependency is really "editing the
+-- task's dependency graph") since there's no separate create/delete
+-- distinction meaningful enough to split, unlike tasks itself above.
 DROP POLICY IF EXISTS task_dependencies_select ON task_dependencies;
 CREATE POLICY task_dependencies_select ON task_dependencies
   FOR SELECT USING (
@@ -1090,7 +1291,7 @@ CREATE POLICY task_dependencies_write ON task_dependencies
       SELECT 1 FROM tasks t
       JOIN projects p ON p.id = t.project_id
       WHERE t.id = successor_task_id
-        AND (is_workspace_admin(t.workspace_id) OR can_perform_on_project(p.id, p.workspace_id, p.visibility, 'task.write'))
+        AND (is_workspace_admin(t.workspace_id) OR can_perform_on_project(p.id, p.workspace_id, p.visibility, 'tasks.edit'))
     )
   );
 
@@ -1163,8 +1364,11 @@ CREATE POLICY project_custom_role_members_select ON project_custom_role_members
 DROP POLICY IF EXISTS project_custom_role_members_insert ON project_custom_role_members;
 CREATE POLICY project_custom_role_members_insert ON project_custom_role_members
   FOR INSERT WITH CHECK (
-    is_workspace_admin(project_workspace_id(project_id))
-    OR has_project_permission(project_id, 'project.manage_members')
+    can_perform_on_project(
+      project_id, project_workspace_id(project_id),
+      (SELECT p.visibility FROM projects p WHERE p.id = project_id),
+      'members.edit'
+    )
     -- The accepting user's base project_members row is inserted in the same
     -- transaction just before this one (see services/project-invitations.ts),
     -- so is_project_member() is already true by the time this runs.
@@ -1174,8 +1378,11 @@ CREATE POLICY project_custom_role_members_insert ON project_custom_role_members
 DROP POLICY IF EXISTS project_custom_role_members_delete ON project_custom_role_members;
 CREATE POLICY project_custom_role_members_delete ON project_custom_role_members
   FOR DELETE USING (
-    is_workspace_admin(project_workspace_id(project_id))
-    OR has_project_permission(project_id, 'project.manage_members')
+    can_perform_on_project(
+      project_id, project_workspace_id(project_id),
+      (SELECT p.visibility FROM projects p WHERE p.id = project_id),
+      'members.edit'
+    )
     OR user_id = current_app_user_id()
   );
 
@@ -1190,24 +1397,21 @@ ALTER TABLE task_members FORCE ROW LEVEL SECURITY;
 DROP POLICY IF EXISTS task_members_select ON task_members;
 CREATE POLICY task_members_select ON task_members
   FOR SELECT USING (
-    is_workspace_admin(workspace_id)
-    OR user_id = current_app_user_id()
+    user_id = current_app_user_id()
     OR can_perform_on_project(
       project_id, workspace_id,
       (SELECT p.visibility FROM projects p WHERE p.id = project_id),
-      'task.write'
+      'tasks.edit'
     )
   );
 
 DROP POLICY IF EXISTS task_members_insert ON task_members;
 CREATE POLICY task_members_insert ON task_members
   FOR INSERT WITH CHECK (
-    is_workspace_admin(workspace_id)
-    OR has_project_permission(project_id, 'project.manage_members')
-    OR can_perform_on_project(
+    can_perform_on_project(
       project_id, workspace_id,
       (SELECT p.visibility FROM projects p WHERE p.id = project_id),
-      'task.write'
+      'tasks.edit'
     )
     -- Invite acceptance bootstrap.
     OR (user_id = current_app_user_id() AND has_pending_task_invite(task_id))
@@ -1216,8 +1420,11 @@ CREATE POLICY task_members_insert ON task_members
 DROP POLICY IF EXISTS task_members_delete ON task_members;
 CREATE POLICY task_members_delete ON task_members
   FOR DELETE USING (
-    is_workspace_admin(workspace_id)
-    OR has_project_permission(project_id, 'project.manage_members')
+    can_perform_on_project(
+      project_id, workspace_id,
+      (SELECT p.visibility FROM projects p WHERE p.id = project_id),
+      'tasks.edit'
+    )
     OR user_id = current_app_user_id() -- self-removal
   );
 
@@ -1267,14 +1474,10 @@ DROP POLICY IF EXISTS task_invitations_insert ON task_invitations;
 CREATE POLICY task_invitations_insert ON task_invitations
   FOR INSERT WITH CHECK (
     inviter_id = current_app_user_id()
-    AND (
-      is_workspace_admin(workspace_id)
-      OR has_project_permission(project_id, 'project.manage_members')
-      OR can_perform_on_project(
-        project_id, workspace_id,
-        (SELECT p.visibility FROM projects p WHERE p.id = project_id),
-        'task.write'
-      )
+    AND can_perform_on_project(
+      project_id, workspace_id,
+      (SELECT p.visibility FROM projects p WHERE p.id = project_id),
+      'tasks.edit'
     )
   );
 

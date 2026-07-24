@@ -523,7 +523,12 @@ export const clientMembers = pgTable("client_members", {
   invitedBy: uuid("invited_by").notNull().references(() => users.id),
   createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
 }, (t) => ({
-  pk: uniqueIndex("client_members_pk").on(t.clientId, t.userId),
+  // Includes custom_role_id (not just client_id+user_id) so a user can hold
+  // MULTIPLE custom roles on the same client at once — their effective
+  // permissions are the OR across every role-granted row (see
+  // has_client_permission() in db/rls-policies.sql). Mirrors
+  // project_custom_role_members' equivalent constraint below.
+  pk: uniqueIndex("client_members_pk").on(t.clientId, t.userId, t.customRoleId),
   userIdx: index("client_members_user_idx").on(t.userId),
 }));
 

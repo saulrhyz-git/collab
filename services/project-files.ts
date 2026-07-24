@@ -2,17 +2,18 @@
  * Per-engagement file uploads — backs both the References tab (category
  * REFERENCE) and the AI Review tab (category AI_REVIEWED, populated by
  * services/ai-review.ts once a document's been analyzed). Mirrors
- * project_files RLS exactly: read follows plain project visibility;
- * upload requires is_workspace_admin OR 'file.upload'; delete requires
- * being the uploader, is_workspace_admin, or 'file.manage'.
+ * project_files RLS exactly: read requires 'files.view'; upload requires
+ * is_workspace_admin OR 'files.create'; the promote-to-references update
+ * requires 'files.edit'; delete requires being the uploader,
+ * is_workspace_admin, or 'files.delete' (canPerform's workspace-admin
+ * bypass is baked into userCanPerformOnProject, so there's no separate
+ * admin check needed here anymore).
  */
 
 import { eq, and } from "drizzle-orm";
 import { db } from "../db/client";
 import { projectFiles, projects } from "../db/schema";
-import { requireProjectAccess, NotFoundError, NotAuthorizedError } from "./tasks";
-import { userHasProjectPermission } from "./permissions";
-import { isSuperAdmin } from "../auth/super-admin";
+import { requireProjectAccess, canPerform, NotFoundError, NotAuthorizedError } from "./tasks";
 import { buildStoragePath, saveFile, readStoredFile, deleteStoredFile } from "../lib/file-storage";
 
 export { NotFoundError, NotAuthorizedError };
@@ -21,14 +22,6 @@ type Category = "REFERENCE" | "AI_REVIEWED";
 
 const MAX_FILE_SIZE_BYTES = 25 * 1024 * 1024; // 25MB — comfortably covers contracts/MOAs as PDF or Word docs
 
-async function isWorkspaceAdminRole(workspaceId: string, userId: string) {
-  if (await isSuperAdmin(userId)) return true;
-  const m = await db.query.workspaceMembers.findFirst({
-    where: (wm, { eq: eqOp, and: andOp }) => andOp(eqOp(wm.workspaceId, workspaceId), eqOp(wm.userId, userId)),
-  });
-  return m?.role === "OWNER" || m?.role === "ADMIN";
-}
-
 async function getProjectOrThrow(projectId: string) {
   const project = await db.query.projects.findFirst({ where: eq(projects.id, projectId) });
   if (!project) throw new NotFoundError("Project not found.");
@@ -36,16 +29,20 @@ async function getProjectOrThrow(projectId: string) {
 }
 
 async function assertCanUpload(projectId: string, workspaceId: string, actingUserId: string) {
-  const role = await requireProjectAccess(projectId, workspaceId, actingUserId);
-  if (await isWorkspaceAdminRole(workspaceId, actingUserId)) return;
-  if (await userHasProjectPermission(role, actingUserId, "file.upload")) return;
+  await requireProjectAccess(projectId, workspaceId, actingUserId);
+  if (await canPerform(actingUserId, projectId, "files.create")) return;
   throw new NotAuthorizedError("You don't have permission to upload files to this engagement.");
 }
 
+async function assertCanEditFiles(projectId: string, workspaceId: string, actingUserId: string) {
+  await requireProjectAccess(projectId, workspaceId, actingUserId);
+  if (await canPerform(actingUserId, projectId, "files.edit")) return;
+  throw new NotAuthorizedError("You don't have permission to edit files on this engagement.");
+}
+
 async function assertCanManageFiles(projectId: string, workspaceId: string, actingUserId: string) {
-  const role = await requireProjectAccess(projectId, workspaceId, actingUserId);
-  if (await isWorkspaceAdminRole(workspaceId, actingUserId)) return;
-  if (await userHasProjectPermission(role, actingUserId, "file.manage")) return;
+  await requireProjectAccess(projectId, workspaceId, actingUserId);
+  if (await canPerform(actingUserId, projectId, "files.delete")) return;
   throw new NotAuthorizedError("You don't have permission to manage files on this engagement.");
 }
 
@@ -136,7 +133,7 @@ export async function promoteFileToReferences(fileId: string, actingUserId: stri
   const file = await db.query.projectFiles.findFirst({ where: eq(projectFiles.id, fileId) });
   if (!file) throw new NotFoundError("File not found.");
 
-  await assertCanUpload(file.projectId, file.workspaceId, actingUserId);
+  await assertCanEditFiles(file.projectId, file.workspaceId, actingUserId);
 
   const [updated] = await db
     .update(projectFiles)

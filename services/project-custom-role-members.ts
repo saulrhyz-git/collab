@@ -6,7 +6,9 @@
  * never touches the underlying project_members row.
  *
  * Mirrors project_custom_role_members_insert/_delete RLS in db/rls-policies.sql:
- * is_workspace_admin(workspace) OR has_project_permission(project, 'project.manage_members').
+ * can_perform_on_project(project, ..., 'members.edit') — includes the
+ * workspace-admin bypass and recognizes custom-role/client-wide grants of
+ * 'members.edit', not just the built-in PROJECT_ADMIN row.
  */
 
 import { eq, and } from "drizzle-orm";
@@ -21,7 +23,7 @@ import {
   activityLogs,
 } from "../db/schema";
 import { isSuperAdmin } from "../auth/super-admin";
-import { userHasProjectPermission } from "./permissions";
+import { userCanPerformOnProject } from "./permissions";
 
 export class NotAuthorizedError extends Error {}
 export class NotFoundError extends Error {}
@@ -43,10 +45,7 @@ async function isWorkspaceAdmin(workspaceId: string, userId: string) {
 
 async function assertCanManageMembers(projectId: string, workspaceId: string, actingUserId: string) {
   if (await isWorkspaceAdmin(workspaceId, actingUserId)) return;
-  const membership = await db.query.projectMembers.findFirst({
-    where: and(eq(projectMembers.projectId, projectId), eq(projectMembers.userId, actingUserId)),
-  });
-  if (await userHasProjectPermission(membership?.role, actingUserId, "project.manage_members")) return;
+  if (await userCanPerformOnProject(actingUserId, projectId, "members.edit")) return;
   throw new NotAuthorizedError("Only a project admin or workspace admin can manage members.");
 }
 

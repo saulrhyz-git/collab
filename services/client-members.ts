@@ -86,6 +86,11 @@ export async function addClientMember(params: {
   const target = await db.query.users.findFirst({ where: eq(users.id, params.targetUserId) });
   if (!target) throw new NotFoundError("User not found.");
 
+  // The unique index is now (clientId, userId, customRoleId) — a user can
+  // hold multiple distinct CLIENT-scoped custom roles on the same client at
+  // once (OR semantics via has_client_permission()). Granting the same role
+  // twice is a harmless no-op rather than an update, since customRoleId is
+  // itself part of the conflict target now.
   await db
     .insert(clientMembers)
     .values({
@@ -95,9 +100,8 @@ export async function addClientMember(params: {
       customRoleId: params.customRoleId,
       invitedBy: params.actingUserId,
     })
-    .onConflictDoUpdate({
-      target: [clientMembers.clientId, clientMembers.userId],
-      set: { customRoleId: params.customRoleId },
+    .onConflictDoNothing({
+      target: [clientMembers.clientId, clientMembers.userId, clientMembers.customRoleId],
     });
 
   await db.insert(activityLogs).values({
@@ -108,6 +112,15 @@ export async function addClientMember(params: {
   });
 }
 
+/**
+ * Removes a collaborator from a client entirely — since a user can now hold
+ * multiple CLIENT-scoped custom roles at once (unique index is (clientId,
+ * userId, customRoleId)), this WHERE clause with no customRoleId filter
+ * deletes every role row the user holds on this client, not just one. The
+ * current UI/route only supports "remove this person from the client", not
+ * "revoke just one of their several roles" — that finer-grained action can
+ * be added later if the UI grows a per-role revoke control.
+ */
 export async function removeClientMember(params: { clientId: string; targetUserId: string; actingUserId: string }) {
   const client = await getClientOrThrow(params.clientId);
 

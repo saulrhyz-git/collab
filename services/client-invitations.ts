@@ -149,6 +149,9 @@ export async function acceptClientInvite(params: {
   }
 
   await db.transaction(async (tx) => {
+    // Unique index is (clientId, userId, customRoleId) — see
+    // services/client-members.ts's addClientMember for why this is
+    // onConflictDoNothing rather than an update now.
     await tx
       .insert(clientMembers)
       .values({
@@ -158,9 +161,8 @@ export async function acceptClientInvite(params: {
         customRoleId: invite.customRoleId,
         invitedBy: invite.inviterId,
       })
-      .onConflictDoUpdate({
-        target: [clientMembers.clientId, clientMembers.userId],
-        set: { customRoleId: invite.customRoleId },
+      .onConflictDoNothing({
+        target: [clientMembers.clientId, clientMembers.userId, clientMembers.customRoleId],
       });
 
     await tx

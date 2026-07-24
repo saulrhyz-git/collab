@@ -11,7 +11,7 @@ import {
   clients,
 } from "../db/schema";
 import { isSuperAdmin } from "../auth/super-admin";
-import { userHasWorkspacePermission, userHasProjectPermission } from "./permissions";
+import { userHasWorkspacePermission, userCanPerformOnProject } from "./permissions";
 
 export class NotAuthorizedError extends Error {}
 export class NotFoundError extends Error {}
@@ -208,8 +208,10 @@ export async function updateProject(params: {
 
   // Mirrors projects_update RLS exactly: is_workspace_admin(workspace_id) OR
   // has_workspace_permission(workspace_id, 'project.manage') OR
-  // has_project_permission(id, 'project.edit'). The first is a structural
+  // has_project_permission(id, 'engagement.edit'). The first is a structural
   // bypass; the latter two are matrix-governed (services/permissions.ts).
+  // userCanPerformOnProject also recognizes a custom role or client-wide
+  // grant holding 'engagement.edit', not just the built-in PROJECT_ADMIN row.
   const isWorkspaceAdmin = await isWorkspaceAdminRole(project.workspaceId, params.actingUserId);
   if (!isWorkspaceAdmin) {
     const workspaceMembership = await db.query.workspaceMembers.findFirst({
@@ -221,10 +223,7 @@ export async function updateProject(params: {
       "project.manage"
     );
     if (!canManageWorkspaceProjects) {
-      const membership = await db.query.projectMembers.findFirst({
-        where: and(eq(projectMembers.projectId, params.projectId), eq(projectMembers.userId, params.actingUserId)),
-      });
-      const canEditProject = await userHasProjectPermission(membership?.role, params.actingUserId, "project.edit");
+      const canEditProject = await userCanPerformOnProject(params.actingUserId, params.projectId, "engagement.edit");
       if (!canEditProject) {
         throw new NotAuthorizedError("Only a project admin or workspace admin can edit this project.");
       }
@@ -252,14 +251,21 @@ export async function archiveProject(projectId: string, actingUserId: string) {
   if (!project) throw new NotFoundError("Project not found.");
 
   // Mirrors projects_delete RLS: is_workspace_admin(workspace_id) OR
-  // has_workspace_permission(workspace_id, 'project.manage').
+  // has_workspace_permission(workspace_id, 'project.manage') OR
+  // has_project_permission(id, 'engagement.delete') — the last branch is
+  // new: a PROJECT_ADMIN (or custom-role holder with engagement.delete) can
+  // now archive the one engagement they administer, without needing the
+  // broader workspace-level project.manage permission.
   if (!(await isWorkspaceAdminRole(project.workspaceId, actingUserId))) {
     const workspaceMembership = await db.query.workspaceMembers.findFirst({
       where: and(eq(workspaceMembers.workspaceId, project.workspaceId), eq(workspaceMembers.userId, actingUserId)),
     });
     const canManage = await userHasWorkspacePermission(workspaceMembership?.role, actingUserId, "project.manage");
     if (!canManage) {
-      throw new NotAuthorizedError("Only a workspace admin can archive a project.");
+      const canDeleteEngagement = await userCanPerformOnProject(actingUserId, projectId, "engagement.delete");
+      if (!canDeleteEngagement) {
+        throw new NotAuthorizedError("Only a workspace admin or engagement admin can archive this project.");
+      }
     }
   }
 

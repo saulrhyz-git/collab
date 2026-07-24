@@ -9,10 +9,10 @@
 import { randomBytes, createHash } from "crypto";
 import { eq, and } from "drizzle-orm";
 import { db } from "../db/client";
-import { taskInvitations, taskMembers, tasks, projectMembers, workspaceMembers, users, activityLogs } from "../db/schema";
+import { taskInvitations, taskMembers, tasks, workspaceMembers, users, activityLogs } from "../db/schema";
 import { sendInviteEmail, sendInAppNotification } from "./notifications";
 import { isSuperAdmin } from "../auth/super-admin";
-import { userHasProjectPermission } from "./permissions";
+import { userCanPerformOnProject } from "./permissions";
 
 const INVITE_TTL_MS = 7 * 24 * 60 * 60 * 1000; // 7 days
 
@@ -39,13 +39,9 @@ async function assertCanInvite(taskId: string, inviterId: string) {
   });
   const isWorkspaceAdmin = workspaceMembership?.role === "OWNER" || workspaceMembership?.role === "ADMIN";
 
-  const projectMembership = await db.query.projectMembers.findFirst({
-    where: and(eq(projectMembers.projectId, task.projectId), eq(projectMembers.userId, inviterId)),
-  });
-  const canWriteTasks =
-    !!projectMembership && (await userHasProjectPermission(projectMembership.role, inviterId, "task.write"));
+  const canEditTasks = await userCanPerformOnProject(inviterId, task.projectId, "tasks.edit");
 
-  if (!isWorkspaceAdmin && !canWriteTasks) {
+  if (!isWorkspaceAdmin && !canEditTasks) {
     throw new NotAuthorizedError("You don't have permission to share this task.");
   }
 
