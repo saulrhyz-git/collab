@@ -45,6 +45,12 @@ interface PendingInvite {
   status: "PENDING" | "EXPIRED";
 }
 
+interface CustomRole {
+  id: string;
+  name: string;
+  scope: "PROJECT" | "CLIENT";
+}
+
 async function fetchMembers(projectId: string): Promise<Member[]> {
   const res = await fetch(`/api/projects/${projectId}/members`, { credentials: "include" });
   if (!res.ok) throw new Error("Failed to load members");
@@ -59,11 +65,17 @@ async function fetchPendingInvites(projectId: string): Promise<PendingInvite[]> 
   return res.json();
 }
 
-async function sendInvite(projectId: string, targetEmail: string, role: ProjectRole) {
+async function fetchProjectCustomRoles(): Promise<CustomRole[]> {
+  const res = await fetch("/api/admin/custom-roles?scope=PROJECT", { credentials: "include" });
+  if (!res.ok) throw new Error("Failed to load custom roles");
+  return res.json();
+}
+
+async function sendInvite(projectId: string, targetEmail: string, role: ProjectRole, customRoleId?: string) {
   const res = await fetch(`/api/projects/${projectId}/invitations`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ targetEmail, role }),
+    body: JSON.stringify({ targetEmail, role, customRoleId: customRoleId || undefined }),
     credentials: "include",
   });
   if (!res.ok) throw new Error((await res.json()).error ?? "Failed to send invite");
@@ -109,6 +121,7 @@ export default function ProjectCollaboratorModal({
 }) {
   const [email, setEmail] = useState("");
   const [role, setRole] = useState<ProjectRole>("VIEWER");
+  const [customRoleId, setCustomRoleId] = useState<string>("__none");
   const [error, setError] = useState<string | null>(null);
   const queryClient = useQueryClient();
 
@@ -126,10 +139,17 @@ export default function ProjectCollaboratorModal({
     enabled: open && canManage,
   });
 
+  const customRolesQuery = useQuery({
+    queryKey: ["custom-roles", "PROJECT"],
+    queryFn: fetchProjectCustomRoles,
+    enabled: open && canManage,
+  });
+
   const inviteMutation = useMutation({
-    mutationFn: () => sendInvite(projectId, email, role),
+    mutationFn: () => sendInvite(projectId, email, role, customRoleId === "__none" ? undefined : customRoleId),
     onSuccess: () => {
       setEmail("");
+      setCustomRoleId("__none");
       setError(null);
       queryClient.invalidateQueries({ queryKey: ["project-invitations", projectId] });
     },
@@ -188,6 +208,21 @@ export default function ProjectCollaboratorModal({
                 <SelectItem value="PROJECT_ADMIN">Admin</SelectItem>
               </SelectContent>
             </Select>
+            {(customRolesQuery.data?.length ?? 0) > 0 && (
+              <Select value={customRoleId} onValueChange={setCustomRoleId}>
+                <SelectTrigger className="w-36">
+                  <SelectValue placeholder="Custom role" />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="__none">No custom role</SelectItem>
+                  {customRolesQuery.data!.map((r) => (
+                    <SelectItem key={r.id} value={r.id}>
+                      + {r.name}
+                    </SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+            )}
             <Button type="submit" disabled={inviteMutation.isPending}>
               {inviteMutation.isPending ? (
                 <Loader2 className="h-4 w-4 animate-spin" />

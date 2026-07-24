@@ -19,6 +19,8 @@ import { sendProjectInvite, listProjectInvitations } from "../../../../../servic
 const sendInviteSchema = z.object({
   targetEmail: z.string().email(),
   role: z.enum(["PROJECT_ADMIN", "EDITOR", "VIEWER"]),
+  /** Optional: layer a PROJECT-scoped custom role on top of `role` (see services/invitations.ts). */
+  customRoleId: z.string().uuid().optional(),
 });
 
 const statusFilterSchema = z
@@ -52,6 +54,7 @@ export const POST = withAuth(async (req, userId, params) => {
     inviterId: userId,
     targetEmail: parsed.data.targetEmail,
     role: parsed.data.role,
+    customRoleId: parsed.data.customRoleId,
   });
   return NextResponse.json(result, { status: 201 });
 });

@@ -19,8 +19,11 @@ import { isSuperAdmin } from "../../../../auth/super-admin";
 import { getPermissionMatrix, setRolePermission, NotAuthorizedError } from "../../../../services/permissions";
 
 const patchSchema = z.object({
-  scope: z.enum(["WORKSPACE", "PROJECT"]),
-  role: z.string().min(1).max(30),
+  // CLIENT is a valid *storage* scope for a CLIENT-scoped custom role's
+  // grant (see services/permissions.ts's getPermissionMatrix/storageScope)
+  // even though there's no CLIENT row in the permission catalog itself.
+  scope: z.enum(["WORKSPACE", "PROJECT", "CLIENT"]),
+  role: z.string().min(1).max(40),
   permissionKey: z.string().min(1).max(100),
   granted: z.boolean(),
 });

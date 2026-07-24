@@ -1,7 +1,15 @@
 import { randomUUID } from "node:crypto";
 import { eq, and, isNull } from "drizzle-orm";
 import { db } from "../db/client";
-import { projects, projectMembers, workspaceMembers, activityLogs, clients } from "../db/schema";
+import {
+  projects,
+  projectMembers,
+  projectCustomRoleMembers,
+  clientMembers,
+  workspaceMembers,
+  activityLogs,
+  clients,
+} from "../db/schema";
 import { isSuperAdmin } from "../auth/super-admin";
 import { userHasWorkspacePermission, userHasProjectPermission } from "./permissions";
 
@@ -18,13 +26,43 @@ async function isWorkspaceMember(workspaceId: string, userId: string) {
   return !!m;
 }
 
-/** Structural bypass mirroring RLS's is_workspace_admin() — OWNER/ADMIN role or super admin, NOT matrix-governed. */
+/** Structural bypass mirroring RLS's is_workspace_admin() — OWNER/ADMIN role or super admin, retained deliberately as an oversight mechanism (see db/rls-policies.sql's PART 2 comment). */
 async function isWorkspaceAdminRole(workspaceId: string, userId: string) {
   if (await isSuperAdmin(userId)) return true;
   const m = await db.query.workspaceMembers.findFirst({
     where: and(eq(workspaceMembers.workspaceId, workspaceId), eq(workspaceMembers.userId, userId)),
   });
   return m?.role === "OWNER" || m?.role === "ADMIN";
+}
+
+/**
+ * Mirrors can_access_project() in db/rls-policies.sql (PART 2): plain
+ * workspace membership + PUBLIC_TO_WORKSPACE visibility no longer grants
+ * anything. Visibility now requires workspace owner/admin oversight, a
+ * direct project_members row, a project-scoped custom role, or a
+ * CLIENT-scope custom role covering this project's client.
+ */
+async function canAccessProject(project: { id: string; workspaceId: string; clientId: string | null }, userId: string): Promise<boolean> {
+  if (await isWorkspaceAdminRole(project.workspaceId, userId)) return true;
+
+  const membership = await db.query.projectMembers.findFirst({
+    where: and(eq(projectMembers.projectId, project.id), eq(projectMembers.userId, userId)),
+  });
+  if (membership) return true;
+
+  const customRoleMembership = await db.query.projectCustomRoleMembers.findFirst({
+    where: and(eq(projectCustomRoleMembers.projectId, project.id), eq(projectCustomRoleMembers.userId, userId)),
+  });
+  if (customRoleMembership) return true;
+
+  if (project.clientId) {
+    const clientMembership = await db.query.clientMembers.findFirst({
+      where: and(eq(clientMembers.clientId, project.clientId), eq(clientMembers.userId, userId)),
+    });
+    if (clientMembership) return true;
+  }
+
+  return false;
 }
 
 /**
@@ -101,10 +139,11 @@ export async function createProject(params: {
 }
 
 /**
- * Lists non-archived projects in a workspace that the requester can see —
- * PUBLIC_TO_WORKSPACE projects show up for any workspace member,
- * PRIVATE_TO_MEMBERS ones only if they're an explicit project member.
- * RLS enforces the same split independently (can_access_project()).
+ * Lists non-archived projects in a workspace that the requester can see.
+ * PUBLIC_TO_WORKSPACE no longer grants anything (see canAccessProject) — a
+ * workspace owner/admin/super admin sees every project; anyone else only
+ * sees ones they're a direct or custom-role project member of, or reach via
+ * a CLIENT-scope custom role on the project's client.
  */
 export async function listProjectsForWorkspace(workspaceId: string, requestingUserId: string) {
   if (!(await isWorkspaceMember(workspaceId, requestingUserId))) {
@@ -117,17 +156,31 @@ export async function listProjectsForWorkspace(workspaceId: string, requestingUs
     with: { client: { columns: { id: true, name: true } } },
   });
 
-  const isSuper = await isSuperAdmin(requestingUserId);
-  if (isSuper) return allProjects;
+  if (await isWorkspaceAdminRole(workspaceId, requestingUserId)) return allProjects;
 
-  const memberships = await db.query.projectMembers.findMany({
-    where: eq(projectMembers.userId, requestingUserId),
-    columns: { projectId: true },
-  });
+  const [memberships, customRoleMemberships, clientMemberships] = await Promise.all([
+    db.query.projectMembers.findMany({
+      where: eq(projectMembers.userId, requestingUserId),
+      columns: { projectId: true },
+    }),
+    db.query.projectCustomRoleMembers.findMany({
+      where: eq(projectCustomRoleMembers.userId, requestingUserId),
+      columns: { projectId: true },
+    }),
+    db.query.clientMembers.findMany({
+      where: eq(clientMembers.userId, requestingUserId),
+      columns: { clientId: true },
+    }),
+  ]);
   const memberProjectIds = new Set(memberships.map((m) => m.projectId));
+  const customRoleProjectIds = new Set(customRoleMemberships.map((m) => m.projectId));
+  const memberClientIds = new Set(clientMemberships.map((m) => m.clientId));
 
   return allProjects.filter(
-    (p) => p.visibility === "PUBLIC_TO_WORKSPACE" || memberProjectIds.has(p.id)
+    (p) =>
+      memberProjectIds.has(p.id) ||
+      customRoleProjectIds.has(p.id) ||
+      (p.clientId !== null && memberClientIds.has(p.clientId))
   );
 }
 
@@ -135,18 +188,11 @@ export async function getProject(projectId: string, requestingUserId: string) {
   const project = await db.query.projects.findFirst({ where: eq(projects.id, projectId) });
   if (!project) throw new NotFoundError("Project not found.");
 
-  if (await isSuperAdmin(requestingUserId)) return project;
-
-  const membership = await db.query.projectMembers.findFirst({
-    where: and(eq(projectMembers.projectId, projectId), eq(projectMembers.userId, requestingUserId)),
-  });
-  if (membership) return project;
-
-  if (project.visibility === "PUBLIC_TO_WORKSPACE" && (await isWorkspaceMember(project.workspaceId, requestingUserId))) {
-    return project;
+  if (!(await canAccessProject(project, requestingUserId))) {
+    throw new NotAuthorizedError("You don't have access to this project.");
   }
 
-  throw new NotAuthorizedError("You don't have access to this project.");
+  return project;
 }
 
 export async function updateProject(params: {

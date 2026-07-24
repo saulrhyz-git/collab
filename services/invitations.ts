@@ -21,6 +21,8 @@ import { db } from "../db/client";
 import {
   projectInvitations,
   projectMembers,
+  projectCustomRoleMembers,
+  customRoles,
   workspaceMembers,
   projects,
   users,
@@ -74,11 +76,21 @@ export async function sendProjectInvite(params: {
   inviterId: string;
   targetEmail: string;
   role: ProjectRole;
+  /** Optional: layer a PROJECT-scoped custom role's permissions on top of `role` for this engagement, applied on acceptance (see acceptProjectInvite). */
+  customRoleId?: string;
 }) {
   const { projectId, inviterId, role } = params;
   const targetEmail = params.targetEmail.trim().toLowerCase();
 
   const project = await assertCanInvite(projectId, inviterId);
+
+  if (params.customRoleId) {
+    const customRole = await db.query.customRoles.findFirst({ where: eq(customRoles.id, params.customRoleId) });
+    if (!customRole) throw new InvalidInviteError("Custom role not found.");
+    if (customRole.scope !== "PROJECT") {
+      throw new InvalidInviteError("Only PROJECT-scoped custom roles can be layered onto an engagement invite.");
+    }
+  }
 
   const existingUser = await db.query.users.findFirst({ where: eq(users.email, targetEmail) });
 
@@ -117,6 +129,7 @@ export async function sendProjectInvite(params: {
       inviteeEmail: targetEmail,
       inviteeUserId: existingUser?.id ?? null,
       role,
+      customRoleId: params.customRoleId ?? null,
       token: tokenHash,
       status: "PENDING",
       expiresAt,
@@ -239,7 +252,23 @@ export async function acceptProjectInvite(params: {
       });
     }
 
-    // 3. Close out the invitation.
+    // 3. Layer on the custom role, if the invite carried one. Runs after
+    //    step 1's project_members insert in this same transaction, so the
+    //    RLS bootstrap branch on project_custom_role_members_insert (which
+    //    checks is_project_member()) already sees this user as a member.
+    if (invite.customRoleId) {
+      await tx
+        .insert(projectCustomRoleMembers)
+        .values({
+          projectId: invite.projectId,
+          userId: acceptingUserId,
+          customRoleId: invite.customRoleId,
+          invitedBy: invite.inviterId,
+        })
+        .onConflictDoNothing();
+    }
+
+    // 4. Close out the invitation.
     await tx
       .update(projectInvitations)
       .set({ status: "ACCEPTED", acceptedAt: new Date(), inviteeUserId: acceptingUserId })
@@ -250,7 +279,7 @@ export async function acceptProjectInvite(params: {
       projectId: invite.projectId,
       userId: acceptingUserId,
       action: "invite.accepted",
-      metadata: { inviteId: invite.id, role: invite.role },
+      metadata: { inviteId: invite.id, role: invite.role, customRoleId: invite.customRoleId },
     });
   });
 

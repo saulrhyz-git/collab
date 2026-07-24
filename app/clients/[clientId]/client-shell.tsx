@@ -4,8 +4,9 @@ import { useState } from "react";
 import Link from "next/link";
 import { useRouter } from "next/navigation";
 import { useQuery } from "@tanstack/react-query";
-import { ArrowLeft, Building2, Mail, User as UserIcon, Plus, Lock, Globe } from "lucide-react";
+import { ArrowLeft, Building2, Mail, User as UserIcon, Plus, Lock, Globe, Users } from "lucide-react";
 import CreateProjectDialog from "@/components/CreateProjectDialog";
+import ClientCollaboratorsModal from "@/components/ClientCollaboratorsModal";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent } from "@/components/ui/card";
 
@@ -36,6 +37,7 @@ async function fetchClient(clientId: string): Promise<ClientDetail> {
 export default function ClientShell({ clientId }: { clientId: string }) {
   const router = useRouter();
   const [createOpen, setCreateOpen] = useState(false);
+  const [collaboratorsOpen, setCollaboratorsOpen] = useState(false);
 
   const { data: client, isLoading, error } = useQuery({
     queryKey: ["client", clientId],
@@ -79,10 +81,16 @@ export default function ClientShell({ clientId }: { clientId: string }) {
                   )}
                 </div>
               </div>
-              <Button size="sm" onClick={() => setCreateOpen(true)}>
-                <Plus className="mr-1.5 h-4 w-4" />
-                New engagement
-              </Button>
+              <div className="flex gap-2">
+                <Button variant="outline" size="sm" onClick={() => setCollaboratorsOpen(true)}>
+                  <Users className="mr-1.5 h-4 w-4" />
+                  Collaborators
+                </Button>
+                <Button size="sm" onClick={() => setCreateOpen(true)}>
+                  <Plus className="mr-1.5 h-4 w-4" />
+                  New engagement
+                </Button>
+              </div>
             </div>
 
             {client.notes && (
@@ -129,6 +137,11 @@ export default function ClientShell({ clientId }: { clientId: string }) {
               open={createOpen}
               onOpenChange={setCreateOpen}
               defaultClientId={client.id}
+            />
+            <ClientCollaboratorsModal
+              clientId={client.id}
+              open={collaboratorsOpen}
+              onOpenChange={setCollaboratorsOpen}
             />
           </>
         )}

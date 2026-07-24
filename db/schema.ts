@@ -96,6 +96,17 @@ export const users = pgTable("users", {
   passwordHash: text("password_hash"), // null when the user only ever signs in via OAuth
   fullName: varchar("full_name", { length: 200 }).notNull(),
   avatarUrl: text("avatar_url"),
+  // Contact/business fields — required contactNumber comes from the
+  // superadmin "add user" form (services/users-admin.ts); the two business
+  // fields are optional there (freelancer/individual users have neither).
+  contactNumber: varchar("contact_number", { length: 40 }),
+  businessName: varchar("business_name", { length: 200 }),
+  businessAddress: text("business_address"),
+  // Set on superadmin-created accounts until the user signs in and changes
+  // it — surfaced in the admin UI as "must reset password" if ever needed,
+  // though nothing currently enforces a forced reset beyond the temporary
+  // password itself (see services/users-admin.ts).
+  mustResetPassword: boolean("must_reset_password").notNull().default(false),
   emailVerifiedAt: timestamp("email_verified_at", { withTimezone: true }),
   // Platform-wide bypass of workspace/project membership checks — see
   // db/rls-policies.sql's is_super_admin() and auth/super-admin.ts. Not
@@ -223,6 +234,12 @@ export const projectInvitations = pgTable("project_invitations", {
   inviteeEmail: varchar("invitee_email", { length: 320 }).notNull(),
   inviteeUserId: uuid("invitee_user_id").references(() => users.id, { onDelete: "set null" }),
   role: projectRoleEnum("role").notNull().default("VIEWER"),
+  // Optional: layer a superadmin-defined custom role's permissions on top of
+  // the built-in `role` above for this one engagement. Nullable because most
+  // invites still just use a built-in role — set means the acceptance flow
+  // (services/project-invitations.ts) also inserts a project_custom_role_members
+  // row alongside the base project_members row.
+  customRoleId: uuid("custom_role_id").references(() => customRoles.id),
   token: varchar("token", { length: 128 }).notNull(), // sha256 hex of the raw token; raw token only ever lives in the email link
   status: invitationStatusEnum("status").notNull().default("PENDING"),
   expiresAt: timestamp("expires_at", { withTimezone: true }).notNull(),
@@ -352,12 +369,15 @@ export const clientsRelations = relations(clients, ({ one, many }) => ({
   workspace: one(workspaces, { fields: [clients.workspaceId], references: [workspaces.id] }),
   createdByUser: one(users, { fields: [clients.createdBy], references: [users.id] }),
   projects: many(projects),
+  members: many(clientMembers),
+  invitations: many(clientInvitations),
 }));
 
 export const projectsRelations = relations(projects, ({ one, many }) => ({
   workspace: one(workspaces, { fields: [projects.workspaceId], references: [workspaces.id] }),
   client: one(clients, { fields: [projects.clientId], references: [clients.id] }),
   members: many(projectMembers),
+  customRoleMembers: many(projectCustomRoleMembers),
   tasks: many(tasks),
   invitations: many(projectInvitations),
 }));
@@ -372,6 +392,7 @@ export const projectInvitationsRelations = relations(projectInvitations, ({ one 
   workspace: one(workspaces, { fields: [projectInvitations.workspaceId], references: [workspaces.id] }),
   inviter: one(users, { fields: [projectInvitations.inviterId], references: [users.id] }),
   inviteeUser: one(users, { fields: [projectInvitations.inviteeUserId], references: [users.id] }),
+  customRole: one(customRoles, { fields: [projectInvitations.customRoleId], references: [customRoles.id] }),
 }));
 
 export const tasksRelations = relations(tasks, ({ one, many }) => ({
@@ -384,6 +405,8 @@ export const tasksRelations = relations(tasks, ({ one, many }) => ({
   comments: many(taskComments),
   dependenciesAsPredecessor: many(taskDependencies, { relationName: "predecessor" }),
   dependenciesAsSuccessor: many(taskDependencies, { relationName: "successor" }),
+  members: many(taskMembers),
+  invitations: many(taskInvitations),
 }));
 
 export const taskDependenciesRelations = relations(taskDependencies, ({ one }) => ({
@@ -419,7 +442,10 @@ export const activityLogsRelations = relations(activityLogs, ({ one }) => ({
 // distinguished by `scope`.
 // ---------------------------------------------------------------------------
 
-export const permissionScopeEnum = pgEnum("permission_scope", ["WORKSPACE", "PROJECT"]);
+// CLIENT was added alongside custom roles: a custom role scoped CLIENT
+// grants its permissions across every engagement under that client at
+// once, rather than one engagement (PROJECT scope) at a time.
+export const permissionScopeEnum = pgEnum("permission_scope", ["WORKSPACE", "PROJECT", "CLIENT"]);
 
 export const permissions = pgTable("permissions", {
   key: varchar("key", { length: 100 }).primaryKey(),
@@ -443,6 +469,198 @@ export const rolePermissions = pgTable("role_permissions", {
 export const rolePermissionsRelations = relations(rolePermissions, ({ one }) => ({
   permission: one(permissions, { fields: [rolePermissions.permissionKey], references: [permissions.key] }),
   updatedByUser: one(users, { fields: [rolePermissions.updatedBy], references: [users.id] }),
+}));
+
+// ---------------------------------------------------------------------------
+// Custom roles — superadmin-created role *names*, scoped CLIENT or PROJECT
+// (never WORKSPACE; the built-in OWNER/ADMIN/MEMBER/GUEST roles already
+// cover that). A custom role plugs into the exact same role_permissions
+// matrix as the built-in roles (role_permissions.role stores this table's
+// id, cast to text, for rows belonging to a custom role) — so "granular
+// matrix, same as today" per the design decision: a custom role isn't a
+// fixed access-level preset, it's a named bucket of the same fine-grained
+// permission-key grants.
+//
+// Assigning a custom role to an actual person for an actual client/project
+// is a separate act (client_members / project_custom_role_members below) —
+// this table only defines what the role *can* do, not who has it.
+// ---------------------------------------------------------------------------
+
+export const customRoles = pgTable("custom_roles", {
+  id: uuid("id").primaryKey().defaultRandom(),
+  name: varchar("name", { length: 100 }).notNull(),
+  scope: permissionScopeEnum("scope").notNull(), // CLIENT or PROJECT only — enforced at the service layer
+  description: text("description"),
+  createdBy: uuid("created_by").notNull().references(() => users.id),
+  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+}, (t) => ({
+  scopeNameUnique: uniqueIndex("custom_roles_scope_name_unique_idx").on(t.scope, t.name),
+}));
+
+export const customRolesRelations = relations(customRoles, ({ one }) => ({
+  createdByUser: one(users, { fields: [customRoles.createdBy], references: [users.id] }),
+}));
+
+// ---------------------------------------------------------------------------
+// client_members — the ONLY way (besides the workspace owner and a super
+// admin) to see or act on a given client and its engagements. Workspace
+// membership alone no longer implies any visibility (see db/rls-policies.sql
+// for the access-model rewrite this backs) — every collaborator besides the
+// owner needs an explicit grant here (for client-wide access) or in
+// project_members / project_custom_role_members (for one engagement) or
+// task_members (for one task).
+// ---------------------------------------------------------------------------
+
+export const clientMembers = pgTable("client_members", {
+  id: uuid("id").primaryKey().defaultRandom(),
+  clientId: uuid("client_id").notNull().references(() => clients.id, { onDelete: "cascade" }),
+  // Denormalized (same convention as tasks/activity_logs) so RLS policies on
+  // this table can check workspace-admin oversight without an extra join
+  // through clients, which has its own, differently-shaped SELECT policy.
+  workspaceId: uuid("workspace_id").notNull().references(() => workspaces.id, { onDelete: "cascade" }),
+  userId: uuid("user_id").notNull().references(() => users.id, { onDelete: "cascade" }),
+  customRoleId: uuid("custom_role_id").notNull().references(() => customRoles.id),
+  invitedBy: uuid("invited_by").notNull().references(() => users.id),
+  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+}, (t) => ({
+  pk: uniqueIndex("client_members_pk").on(t.clientId, t.userId),
+  userIdx: index("client_members_user_idx").on(t.userId),
+}));
+
+export const clientMembersRelations = relations(clientMembers, ({ one }) => ({
+  client: one(clients, { fields: [clientMembers.clientId], references: [clients.id] }),
+  workspace: one(workspaces, { fields: [clientMembers.workspaceId], references: [workspaces.id] }),
+  user: one(users, { fields: [clientMembers.userId], references: [users.id] }),
+  customRole: one(customRoles, { fields: [clientMembers.customRoleId], references: [customRoles.id] }),
+}));
+
+// ---------------------------------------------------------------------------
+// project_custom_role_members — an ADDITIONAL grant layered on top of the
+// existing project_members built-in role (PROJECT_ADMIN/EDITOR/VIEWER),
+// letting a super admin hand someone a superadmin-defined custom role's
+// permissions on one specific engagement instead of (or in addition to)
+// a built-in one. Deliberately a separate table rather than reshaping
+// project_members, so every existing project_members-based check keeps
+// working unchanged; permission checks just also consult this table.
+// ---------------------------------------------------------------------------
+
+export const projectCustomRoleMembers = pgTable("project_custom_role_members", {
+  id: uuid("id").primaryKey().defaultRandom(),
+  projectId: uuid("project_id").notNull().references(() => projects.id, { onDelete: "cascade" }),
+  userId: uuid("user_id").notNull().references(() => users.id, { onDelete: "cascade" }),
+  customRoleId: uuid("custom_role_id").notNull().references(() => customRoles.id),
+  invitedBy: uuid("invited_by").notNull().references(() => users.id),
+  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+}, (t) => ({
+  pk: uniqueIndex("project_custom_role_members_pk").on(t.projectId, t.userId, t.customRoleId),
+  userIdx: index("project_custom_role_members_user_idx").on(t.userId),
+}));
+
+export const projectCustomRoleMembersRelations = relations(projectCustomRoleMembers, ({ one }) => ({
+  project: one(projects, { fields: [projectCustomRoleMembers.projectId], references: [projects.id] }),
+  user: one(users, { fields: [projectCustomRoleMembers.userId], references: [users.id] }),
+  customRole: one(customRoles, { fields: [projectCustomRoleMembers.customRoleId], references: [customRoles.id] }),
+}));
+
+// ---------------------------------------------------------------------------
+// task_members — true task-level access: view or edit exactly one task,
+// without any visibility into the rest of the engagement's backlog. Kept
+// deliberately simple (two levels, not the full permission matrix) since
+// the ask was specifically about narrow one-task sharing, not a general
+// task-scoped permission system.
+// ---------------------------------------------------------------------------
+
+export const taskMemberRoleEnum = pgEnum("task_member_role", ["VIEWER", "EDITOR"]);
+
+export const taskMembers = pgTable("task_members", {
+  id: uuid("id").primaryKey().defaultRandom(),
+  taskId: uuid("task_id").notNull().references(() => tasks.id, { onDelete: "cascade" }),
+  // Denormalized (same convention as tasks/activity_logs) so RLS policies
+  // here can check project/workspace-level oversight without a join.
+  projectId: uuid("project_id").notNull().references(() => projects.id, { onDelete: "cascade" }),
+  workspaceId: uuid("workspace_id").notNull().references(() => workspaces.id, { onDelete: "cascade" }),
+  userId: uuid("user_id").notNull().references(() => users.id, { onDelete: "cascade" }),
+  role: taskMemberRoleEnum("role").notNull().default("VIEWER"),
+  invitedBy: uuid("invited_by").notNull().references(() => users.id),
+  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+}, (t) => ({
+  pk: uniqueIndex("task_members_pk").on(t.taskId, t.userId),
+  userIdx: index("task_members_user_idx").on(t.userId),
+}));
+
+export const taskMembersRelations = relations(taskMembers, ({ one }) => ({
+  task: one(tasks, { fields: [taskMembers.taskId], references: [tasks.id] }),
+  project: one(projects, { fields: [taskMembers.projectId], references: [projects.id] }),
+  workspace: one(workspaces, { fields: [taskMembers.workspaceId], references: [workspaces.id] }),
+  user: one(users, { fields: [taskMembers.userId], references: [users.id] }),
+}));
+
+// ---------------------------------------------------------------------------
+// client_invitations / task_invitations — same shape and security properties
+// as project_invitations (sha256'd token, expiry, revocation, replay-safe
+// acceptance): invite someone by email to a client (with a CLIENT-scope
+// custom role) or to a single task (VIEWER/EDITOR), without giving them a
+// full project_members row. Project-scope custom-role invites reuse
+// project_invitations directly (see its new nullable custom_role_id column
+// below) rather than a third invitations table, since that flow already
+// exists end to end.
+// ---------------------------------------------------------------------------
+
+export const clientInvitations = pgTable("client_invitations", {
+  id: uuid("id").primaryKey().defaultRandom(),
+  clientId: uuid("client_id").notNull().references(() => clients.id, { onDelete: "cascade" }),
+  workspaceId: uuid("workspace_id").notNull().references(() => workspaces.id, { onDelete: "cascade" }),
+  inviterId: uuid("inviter_id").notNull().references(() => users.id),
+  inviteeEmail: varchar("invitee_email", { length: 320 }).notNull(),
+  inviteeUserId: uuid("invitee_user_id").references(() => users.id, { onDelete: "set null" }),
+  customRoleId: uuid("custom_role_id").notNull().references(() => customRoles.id),
+  token: varchar("token", { length: 128 }).notNull(),
+  status: invitationStatusEnum("status").notNull().default("PENDING"),
+  expiresAt: timestamp("expires_at", { withTimezone: true }).notNull(),
+  acceptedAt: timestamp("accepted_at", { withTimezone: true }),
+  revokedAt: timestamp("revoked_at", { withTimezone: true }),
+  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+}, (t) => ({
+  tokenUnique: uniqueIndex("client_invitations_token_unique_idx").on(t.token),
+  clientStatusIdx: index("client_invitations_client_status_idx").on(t.clientId, t.status),
+  inviteeEmailIdx: index("client_invitations_invitee_email_idx").on(t.inviteeEmail),
+}));
+
+export const clientInvitationsRelations = relations(clientInvitations, ({ one }) => ({
+  client: one(clients, { fields: [clientInvitations.clientId], references: [clients.id] }),
+  workspace: one(workspaces, { fields: [clientInvitations.workspaceId], references: [workspaces.id] }),
+  inviter: one(users, { fields: [clientInvitations.inviterId], references: [users.id] }),
+  inviteeUser: one(users, { fields: [clientInvitations.inviteeUserId], references: [users.id] }),
+  customRole: one(customRoles, { fields: [clientInvitations.customRoleId], references: [customRoles.id] }),
+}));
+
+export const taskInvitations = pgTable("task_invitations", {
+  id: uuid("id").primaryKey().defaultRandom(),
+  taskId: uuid("task_id").notNull().references(() => tasks.id, { onDelete: "cascade" }),
+  projectId: uuid("project_id").notNull().references(() => projects.id, { onDelete: "cascade" }),
+  workspaceId: uuid("workspace_id").notNull().references(() => workspaces.id, { onDelete: "cascade" }),
+  inviterId: uuid("inviter_id").notNull().references(() => users.id),
+  inviteeEmail: varchar("invitee_email", { length: 320 }).notNull(),
+  inviteeUserId: uuid("invitee_user_id").references(() => users.id, { onDelete: "set null" }),
+  role: taskMemberRoleEnum("role").notNull().default("VIEWER"),
+  token: varchar("token", { length: 128 }).notNull(),
+  status: invitationStatusEnum("status").notNull().default("PENDING"),
+  expiresAt: timestamp("expires_at", { withTimezone: true }).notNull(),
+  acceptedAt: timestamp("accepted_at", { withTimezone: true }),
+  revokedAt: timestamp("revoked_at", { withTimezone: true }),
+  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+}, (t) => ({
+  tokenUnique: uniqueIndex("task_invitations_token_unique_idx").on(t.token),
+  taskStatusIdx: index("task_invitations_task_status_idx").on(t.taskId, t.status),
+  inviteeEmailIdx: index("task_invitations_invitee_email_idx").on(t.inviteeEmail),
+}));
+
+export const taskInvitationsRelations = relations(taskInvitations, ({ one }) => ({
+  task: one(tasks, { fields: [taskInvitations.taskId], references: [tasks.id] }),
+  project: one(projects, { fields: [taskInvitations.projectId], references: [projects.id] }),
+  workspace: one(workspaces, { fields: [taskInvitations.workspaceId], references: [workspaces.id] }),
+  inviter: one(users, { fields: [taskInvitations.inviterId], references: [users.id] }),
+  inviteeUser: one(users, { fields: [taskInvitations.inviteeUserId], references: [users.id] }),
 }));
 
 // ---------------------------------------------------------------------------
@@ -586,3 +804,9 @@ export type EngagementType = typeof engagementTypes.$inferSelect;
 export type SmtpSettings = typeof smtpSettings.$inferSelect;
 export type AiProviderSettings = typeof aiProviderSettings.$inferSelect;
 export type ProjectFile = typeof projectFiles.$inferSelect;
+export type CustomRole = typeof customRoles.$inferSelect;
+export type ClientMember = typeof clientMembers.$inferSelect;
+export type ProjectCustomRoleMember = typeof projectCustomRoleMembers.$inferSelect;
+export type TaskMember = typeof taskMembers.$inferSelect;
+export type ClientInvitation = typeof clientInvitations.$inferSelect;
+export type TaskInvitation = typeof taskInvitations.$inferSelect;

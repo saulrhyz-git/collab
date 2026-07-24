@@ -36,6 +36,7 @@ async function sendEmail(params: { to: string; subject: string; text: string; ht
 export async function sendInviteEmail(params: {
   to: string;
   rawToken: string;
+  /** Informational only (not used to build the link below) — the id of whatever's being invited into (project/client/task), kept for future per-context email copy. */
   projectId: string;
   isExistingUser: boolean;
 }) {
@@ -53,7 +54,7 @@ export async function sendInviteEmail(params: {
 
 export async function sendInAppNotification(params: {
   userId: string;
-  type: "PROJECT_INVITE" | "TASK_ASSIGNED" | "MENTION";
+  type: "PROJECT_INVITE" | "TASK_ASSIGNED" | "MENTION" | "CLIENT_INVITE" | "TASK_INVITE";
   payload: Record<string, unknown>;
 }) {
   // Insert into a `notifications` table (omitted from the core schema

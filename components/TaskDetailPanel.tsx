@@ -2,7 +2,7 @@
 
 import { useEffect, useState } from "react";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
-import { Plus, Trash2 } from "lucide-react";
+import { Plus, Trash2, Share2 } from "lucide-react";
 import { Sheet, SheetContent, SheetHeader, SheetTitle } from "@/components/ui/sheet";
 import { Input } from "@/components/ui/input";
 import { Textarea } from "@/components/ui/textarea";
@@ -16,6 +16,7 @@ import {
   SelectValue,
 } from "@/components/ui/select";
 import { Avatar, AvatarFallback, AvatarImage } from "@/components/ui/avatar";
+import TaskCollaboratorsModal from "@/components/TaskCollaboratorsModal";
 
 type TaskStatus = "BACKLOG" | "TODO" | "IN_PROGRESS" | "IN_REVIEW" | "DONE" | "ARCHIVED";
 type TaskPriority = "LOW" | "MEDIUM" | "HIGH" | "URGENT";
@@ -115,6 +116,7 @@ export default function TaskDetailPanel({
   const [newComment, setNewComment] = useState("");
   const [addingDependency, setAddingDependency] = useState(false);
   const [dependencyTaskId, setDependencyTaskId] = useState("");
+  const [collaboratorsOpen, setCollaboratorsOpen] = useState(false);
 
   useEffect(() => {
     if (task) {
@@ -191,7 +193,7 @@ export default function TaskDetailPanel({
   return (
     <Sheet open onOpenChange={(open) => !open && onClose()}>
       <SheetContent className="flex flex-col overflow-y-auto sm:max-w-lg">
-        <SheetHeader>
+        <SheetHeader className="flex-row items-start justify-between gap-2 space-y-0">
           {canEdit ? (
             <Input
               value={title}
@@ -202,6 +204,10 @@ export default function TaskDetailPanel({
           ) : (
             <SheetTitle>{task.title}</SheetTitle>
           )}
+          <Button variant="outline" size="sm" className="shrink-0" onClick={() => setCollaboratorsOpen(true)}>
+            <Share2 className="mr-1.5 h-3.5 w-3.5" />
+            Share
+          </Button>
         </SheetHeader>
 
         <div className="grid grid-cols-2 gap-3 text-sm">
@@ -388,6 +394,13 @@ export default function TaskDetailPanel({
           </form>
         </div>
       </SheetContent>
+
+      <TaskCollaboratorsModal
+        projectId={projectId}
+        taskId={taskId}
+        open={collaboratorsOpen}
+        onOpenChange={setCollaboratorsOpen}
+      />
     </Sheet>
   );
 }

@@ -20,9 +20,14 @@ import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { cn } from "@/lib/utils";
 
 type Scope = "WORKSPACE" | "PROJECT";
+type StorageScope = "WORKSPACE" | "PROJECT" | "CLIENT";
 
 interface RoleGrant {
   role: string;
+  label: string;
+  /** What actually keys this cell's role_permissions row — see services/permissions.ts. */
+  storageScope: StorageScope;
+  isCustom: boolean;
   granted: boolean;
 }
 
@@ -56,7 +61,7 @@ export default function PermissionsMatrixShell() {
   });
 
   const toggle = useMutation({
-    mutationFn: async (params: { scope: Scope; role: string; permissionKey: string; granted: boolean }) => {
+    mutationFn: async (params: { scope: StorageScope; role: string; permissionKey: string; granted: boolean }) => {
       const res = await fetch("/api/admin/permissions", {
         method: "PATCH",
         headers: { "Content-Type": "application/json" },
@@ -114,18 +119,25 @@ export default function PermissionsMatrixShell() {
                 scope="WORKSPACE"
                 rows={workspaceRows}
                 pendingCell={pendingCell}
-                onToggle={(role, permissionKey, granted) =>
-                  toggle.mutate({ scope: "WORKSPACE", role, permissionKey, granted })
+                onToggle={(storageScope, role, permissionKey, granted) =>
+                  toggle.mutate({ scope: storageScope, role, permissionKey, granted })
                 }
               />
             </TabsContent>
             <TabsContent value="PROJECT">
+              <p className="mb-2 text-xs text-muted-foreground">
+                Columns in italics are superadmin-created custom roles (see{" "}
+                <a href="/admin/custom-roles" className="underline">
+                  Custom roles
+                </a>
+                ) — "(client-wide)" ones apply across every engagement under a client at once.
+              </p>
               <MatrixGrid
                 scope="PROJECT"
                 rows={projectRows}
                 pendingCell={pendingCell}
-                onToggle={(role, permissionKey, granted) =>
-                  toggle.mutate({ scope: "PROJECT", role, permissionKey, granted })
+                onToggle={(storageScope, role, permissionKey, granted) =>
+                  toggle.mutate({ scope: storageScope, role, permissionKey, granted })
                 }
               />
             </TabsContent>
@@ -145,7 +157,7 @@ function MatrixGrid({
   scope: Scope;
   rows: PermissionRow[];
   pendingCell: string | null;
-  onToggle: (role: string, permissionKey: string, granted: boolean) => void;
+  onToggle: (storageScope: StorageScope, role: string, permissionKey: string, granted: boolean) => void;
 }) {
   if (rows.length === 0) {
     return (
@@ -155,7 +167,10 @@ function MatrixGrid({
     );
   }
 
-  const roles = rows[0].roles.map((r) => r.role);
+  // Column set is the same for every row within a scope (built-ins plus
+  // whatever custom roles exist for that scope), so the header can just
+  // read it off the first row.
+  const columns = rows[0].roles;
 
   return (
     <Card className="mt-3">
@@ -164,9 +179,12 @@ function MatrixGrid({
           <thead>
             <tr className="border-b-2 border-b-gold bg-muted/40">
               <th className="w-72 px-4 py-2 text-left font-semibold">Permission</th>
-              {roles.map((role) => (
-                <th key={role} className="px-3 py-2 text-center font-semibold">
-                  {role}
+              {columns.map((col) => (
+                <th
+                  key={`${col.storageScope}:${col.role}`}
+                  className={cn("px-3 py-2 text-center font-semibold", col.isCustom && "italic")}
+                >
+                  {col.label}
                 </th>
               ))}
             </tr>
@@ -181,10 +199,10 @@ function MatrixGrid({
                   )}
                 </td>
                 {row.roles.map((cell) => {
-                  const cellId = `${scope}:${cell.role}:${row.key}`;
+                  const cellId = `${cell.storageScope}:${cell.role}:${row.key}`;
                   const isPending = pendingCell === cellId;
                   return (
-                    <td key={cell.role} className="px-3 py-2.5 text-center">
+                    <td key={`${cell.storageScope}:${cell.role}`} className="px-3 py-2.5 text-center">
                       <input
                         type="checkbox"
                         className={cn(
@@ -192,7 +210,7 @@ function MatrixGrid({
                         )}
                         checked={cell.granted}
                         disabled={isPending}
-                        onChange={(e) => onToggle(cell.role, row.key, e.target.checked)}
+                        onChange={(e) => onToggle(cell.storageScope, cell.role, row.key, e.target.checked)}
                       />
                     </td>
                   );

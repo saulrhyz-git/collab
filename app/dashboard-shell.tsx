@@ -172,6 +172,12 @@ export default function DashboardShell({
                   <Link href="/admin/permissions">Permissions matrix</Link>
                 </DropdownMenuItem>
                 <DropdownMenuItem asChild>
+                  <Link href="/admin/custom-roles">Custom roles</Link>
+                </DropdownMenuItem>
+                <DropdownMenuItem asChild>
+                  <Link href="/admin/users">Users</Link>
+                </DropdownMenuItem>
+                <DropdownMenuItem asChild>
                   <Link href="/admin/task-templates">Task templates</Link>
                 </DropdownMenuItem>
                 <DropdownMenuItem asChild>

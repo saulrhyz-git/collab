@@ -827,3 +827,462 @@ CREATE POLICY project_files_delete ON project_files
         AND (is_workspace_admin(p.workspace_id) OR can_perform_on_project(p.id, p.workspace_id, p.visibility, 'file.manage'))
     )
   );
+
+-- ============================================================================
+-- PART 2 — Custom roles, client-level & task-level collaborator access,
+-- and the workspace-isolation rework.
+--
+-- The access model changes here:
+--   - Plain workspace membership (MEMBER/GUEST) NO LONGER implies visibility
+--     into a workspace's clients/projects/tasks. Only the workspace's own
+--     owner or a workspace ADMIN (is_workspace_admin(), unchanged, retained
+--     deliberately as an oversight bypass) or a super admin sees everything
+--     by default. Everyone else needs an explicit grant: a client_members
+--     row (client-wide), a project_members / project_custom_role_members
+--     row (one engagement), or a task_members row (one task only).
+--   - PUBLIC_TO_WORKSPACE, as a functioning concept, goes away: it no longer
+--     grants access to anyone (see can_access_project/can_perform_on_project
+--     below — the visibility argument is still accepted, for call-site
+--     compatibility, but is no longer consulted).
+--   - Custom roles plug into the SAME role_permissions matrix has_permission()
+--     already reads — a custom role's grants live at (scope, role, key)
+--     where `role` is the custom role's id cast to text and `scope` is
+--     'PROJECT' (assigned via project_custom_role_members) or 'CLIENT'
+--     (assigned via client_members, applying across every one of that
+--     client's engagements at once). No new matrix table needed.
+-- ============================================================================
+
+-- ---------------------------------------------------------------------------
+-- New bypass helpers (same SECURITY DEFINER + rls_helper pattern used above,
+-- for the same two reasons: self-referential recursion (a table's own
+-- policy needs a fact about that same table) and cross-table checks that
+-- don't match the referenced table's own SELECT policy).
+-- ---------------------------------------------------------------------------
+
+GRANT SELECT ON custom_roles, client_members, project_custom_role_members, task_members, clients, tasks
+  TO rls_helper;
+
+-- Does the current user hold ANY client_members grant for this client
+-- (regardless of which custom role)?
+CREATE OR REPLACE FUNCTION is_client_member(c_id uuid) RETURNS boolean AS $$
+  SELECT is_super_admin() OR EXISTS (
+    SELECT 1 FROM client_members cm
+    WHERE cm.client_id = c_id AND cm.user_id = current_app_user_id()
+  );
+$$ LANGUAGE sql STABLE SECURITY DEFINER SET search_path = public;
+ALTER FUNCTION is_client_member(uuid) OWNER TO rls_helper;
+
+-- Bypasses clients' own (now client_members-dependent) SELECT policy so a
+-- client's creator can see the row they just inserted, mirroring
+-- is_project_creator() above.
+CREATE OR REPLACE FUNCTION is_client_creator(c_id uuid) RETURNS boolean AS $$
+  SELECT EXISTS (SELECT 1 FROM clients c WHERE c.id = c_id AND c.created_by = current_app_user_id());
+$$ LANGUAGE sql STABLE SECURITY DEFINER SET search_path = public;
+ALTER FUNCTION is_client_creator(uuid) OWNER TO rls_helper;
+
+-- A project's client_id, read bypassing projects' own SELECT policy (which
+-- itself depends on can_access_project(), which depends on this) — plain
+-- column lookup, no recursion risk.
+CREATE OR REPLACE FUNCTION project_client_id(p_id uuid) RETURNS uuid AS $$
+  SELECT client_id FROM projects WHERE id = p_id;
+$$ LANGUAGE sql STABLE SECURITY DEFINER SET search_path = public;
+ALTER FUNCTION project_client_id(uuid) OWNER TO rls_helper;
+
+-- CLIENT-scope custom-role access reaches every engagement under that
+-- client at once — a project with no client_id simply never matches here.
+CREATE OR REPLACE FUNCTION is_client_member_for_project(p_id uuid) RETURNS boolean AS $$
+  SELECT project_client_id(p_id) IS NOT NULL AND is_client_member(project_client_id(p_id));
+$$ LANGUAGE sql STABLE;
+
+CREATE OR REPLACE FUNCTION has_client_permission(c_id uuid, p_key text) RETURNS boolean AS $$
+  SELECT is_super_admin() OR EXISTS (
+    SELECT 1 FROM client_members cm
+    WHERE cm.client_id = c_id
+      AND cm.user_id = current_app_user_id()
+      AND has_permission('CLIENT', cm.custom_role_id::text, p_key)
+  );
+$$ LANGUAGE sql STABLE SECURITY DEFINER SET search_path = public;
+ALTER FUNCTION has_client_permission(uuid, text) OWNER TO rls_helper;
+
+CREATE OR REPLACE FUNCTION has_client_permission_for_project(p_id uuid, p_key text) RETURNS boolean AS $$
+  SELECT project_client_id(p_id) IS NOT NULL AND has_client_permission(project_client_id(p_id), p_key);
+$$ LANGUAGE sql STABLE;
+
+-- Does the current user hold a project-scoped custom role on this project
+-- (layered on top of, or instead of, a built-in project_members role)?
+CREATE OR REPLACE FUNCTION is_project_custom_role_member(p_id uuid) RETURNS boolean AS $$
+  SELECT is_super_admin() OR EXISTS (
+    SELECT 1 FROM project_custom_role_members pcrm
+    WHERE pcrm.project_id = p_id AND pcrm.user_id = current_app_user_id()
+  );
+$$ LANGUAGE sql STABLE SECURITY DEFINER SET search_path = public;
+ALTER FUNCTION is_project_custom_role_member(uuid) OWNER TO rls_helper;
+
+CREATE OR REPLACE FUNCTION has_project_custom_role_permission(p_id uuid, p_key text) RETURNS boolean AS $$
+  SELECT is_super_admin() OR EXISTS (
+    SELECT 1 FROM project_custom_role_members pcrm
+    WHERE pcrm.project_id = p_id
+      AND pcrm.user_id = current_app_user_id()
+      AND has_permission('PROJECT', pcrm.custom_role_id::text, p_key)
+  );
+$$ LANGUAGE sql STABLE SECURITY DEFINER SET search_path = public;
+ALTER FUNCTION has_project_custom_role_permission(uuid, text) OWNER TO rls_helper;
+
+-- Narrow, single-task grants — deliberately NOT routed through the
+-- permissions matrix (see task_members' schema comment): just VIEWER/EDITOR.
+CREATE OR REPLACE FUNCTION is_task_member(t_id uuid) RETURNS boolean AS $$
+  SELECT is_super_admin() OR EXISTS (
+    SELECT 1 FROM task_members tm
+    WHERE tm.task_id = t_id AND tm.user_id = current_app_user_id()
+  );
+$$ LANGUAGE sql STABLE SECURITY DEFINER SET search_path = public;
+ALTER FUNCTION is_task_member(uuid) OWNER TO rls_helper;
+
+CREATE OR REPLACE FUNCTION has_task_edit_permission(t_id uuid) RETURNS boolean AS $$
+  SELECT is_super_admin() OR EXISTS (
+    SELECT 1 FROM task_members tm
+    WHERE tm.task_id = t_id AND tm.user_id = current_app_user_id() AND tm.role = 'EDITOR'
+  );
+$$ LANGUAGE sql STABLE SECURITY DEFINER SET search_path = public;
+ALTER FUNCTION has_task_edit_permission(uuid) OWNER TO rls_helper;
+
+-- Pending client/task invite lookups — same bootstrap reasoning as
+-- has_pending_workspace_invite()/has_pending_project_invite() above: an
+-- invite addressed to an email predating the invitee's account has
+-- invitee_user_id still NULL, so the invitations table's own SELECT policy
+-- (inviter/invitee/admin) doesn't yet match the accepting user.
+GRANT SELECT ON client_invitations, task_invitations TO rls_helper;
+
+CREATE OR REPLACE FUNCTION has_pending_client_invite(c_id uuid) RETURNS boolean AS $$
+  SELECT EXISTS (
+    SELECT 1 FROM client_invitations ci
+    WHERE ci.client_id = c_id
+      AND ci.status = 'PENDING'
+      AND (
+        ci.invitee_user_id = current_app_user_id()
+        OR ci.invitee_email = (SELECT u.email FROM users u WHERE u.id = current_app_user_id())
+      )
+  );
+$$ LANGUAGE sql STABLE SECURITY DEFINER SET search_path = public;
+ALTER FUNCTION has_pending_client_invite(uuid) OWNER TO rls_helper;
+
+CREATE OR REPLACE FUNCTION has_pending_task_invite(t_id uuid) RETURNS boolean AS $$
+  SELECT EXISTS (
+    SELECT 1 FROM task_invitations ti
+    WHERE ti.task_id = t_id
+      AND ti.status = 'PENDING'
+      AND (
+        ti.invitee_user_id = current_app_user_id()
+        OR ti.invitee_email = (SELECT u.email FROM users u WHERE u.id = current_app_user_id())
+      )
+  );
+$$ LANGUAGE sql STABLE SECURITY DEFINER SET search_path = public;
+ALTER FUNCTION has_pending_task_invite(uuid) OWNER TO rls_helper;
+
+-- ---------------------------------------------------------------------------
+-- Overrides: these CREATE OR REPLACE the same-named functions/policies
+-- defined earlier in this file. Postgres just swaps the catalog entry — the
+-- later definition (this one) wins for every subsequent query, so this is a
+-- deliberate "layer a rework on top" structure rather than a duplicate.
+-- ---------------------------------------------------------------------------
+
+-- can_access_project: no longer grants anything via PUBLIC_TO_WORKSPACE +
+-- plain workspace membership. Visibility now requires one of: workspace
+-- owner/admin oversight, a direct project_members row, a project-scoped
+-- custom role, or a CLIENT-scope custom role covering this project's client.
+CREATE OR REPLACE FUNCTION can_access_project(p_id uuid, ws_id uuid, visibility project_visibility) RETURNS boolean AS $$
+  SELECT
+    is_workspace_admin(ws_id)
+    OR is_project_member(p_id)
+    OR is_project_custom_role_member(p_id)
+    OR is_client_member_for_project(p_id);
+$$ LANGUAGE sql STABLE;
+
+CREATE OR REPLACE FUNCTION can_perform_on_project(p_id uuid, ws_id uuid, visibility project_visibility, p_key text) RETURNS boolean AS $$
+  SELECT
+    is_workspace_admin(ws_id)
+    OR has_project_permission(p_id, p_key)
+    OR has_project_custom_role_permission(p_id, p_key)
+    OR has_client_permission_for_project(p_id, p_key);
+$$ LANGUAGE sql STABLE;
+
+-- clients_select: workspace membership alone no longer implies visibility —
+-- needs owner/admin oversight, having created the client, or an explicit
+-- client_members grant.
+DROP POLICY IF EXISTS clients_select ON clients;
+CREATE POLICY clients_select ON clients
+  FOR SELECT USING (
+    is_workspace_admin(workspace_id)
+    OR created_by = current_app_user_id()
+    OR is_client_member(id)
+  );
+
+-- tasks_select / tasks_write: add the task_members narrow-ACL branch on top
+-- of the (already reworked, via can_access_project) engagement-level check.
+DROP POLICY IF EXISTS tasks_select ON tasks;
+CREATE POLICY tasks_select ON tasks
+  FOR SELECT USING (
+    is_task_member(id)
+    OR EXISTS (
+      SELECT 1 FROM projects p
+      WHERE p.id = project_id AND can_access_project(p.id, p.workspace_id, p.visibility)
+    )
+  );
+
+DROP POLICY IF EXISTS tasks_write ON tasks;
+CREATE POLICY tasks_write ON tasks
+  FOR ALL USING (
+    is_workspace_admin(workspace_id)
+    OR has_task_edit_permission(id)
+    OR can_perform_on_project(
+      project_id,
+      workspace_id,
+      (SELECT p.visibility FROM projects p WHERE p.id = project_id),
+      'task.write'
+    )
+  );
+
+-- task_comments: a task_members grant (VIEWER or EDITOR) can read and post
+-- comments on that one task, same latitude VIEWER-role project members get.
+DROP POLICY IF EXISTS task_comments_select ON task_comments;
+CREATE POLICY task_comments_select ON task_comments
+  FOR SELECT USING (
+    is_task_member(task_id)
+    OR EXISTS (
+      SELECT 1 FROM tasks t
+      JOIN projects p ON p.id = t.project_id
+      WHERE t.id = task_id AND can_access_project(p.id, p.workspace_id, p.visibility)
+    )
+  );
+
+DROP POLICY IF EXISTS task_comments_insert ON task_comments;
+CREATE POLICY task_comments_insert ON task_comments
+  FOR INSERT WITH CHECK (
+    author_id = current_app_user_id()
+    AND (
+      is_task_member(task_id)
+      OR EXISTS (
+        SELECT 1 FROM tasks t
+        JOIN projects p ON p.id = t.project_id
+        WHERE t.id = task_id AND can_perform_on_project(p.id, p.workspace_id, p.visibility, 'task.comment')
+      )
+    )
+  );
+
+-- task_dependencies: a task_members grant on the successor task lets that
+-- collaborator see the dependency; editing it requires the EDITOR level.
+DROP POLICY IF EXISTS task_dependencies_select ON task_dependencies;
+CREATE POLICY task_dependencies_select ON task_dependencies
+  FOR SELECT USING (
+    is_task_member(successor_task_id)
+    OR EXISTS (
+      SELECT 1 FROM tasks t
+      JOIN projects p ON p.id = t.project_id
+      WHERE t.id = successor_task_id AND can_access_project(p.id, p.workspace_id, p.visibility)
+    )
+  );
+
+DROP POLICY IF EXISTS task_dependencies_write ON task_dependencies;
+CREATE POLICY task_dependencies_write ON task_dependencies
+  FOR ALL USING (
+    has_task_edit_permission(successor_task_id)
+    OR EXISTS (
+      SELECT 1 FROM tasks t
+      JOIN projects p ON p.id = t.project_id
+      WHERE t.id = successor_task_id
+        AND (is_workspace_admin(t.workspace_id) OR can_perform_on_project(p.id, p.workspace_id, p.visibility, 'task.write'))
+    )
+  );
+
+-- ---------------------------------------------------------------------------
+-- custom_roles — superadmin-only to create/edit/delete (mirrors
+-- task_templates); readable by any authenticated user so invite pickers and
+-- the permission-matrix UI can list them.
+-- ---------------------------------------------------------------------------
+ALTER TABLE custom_roles ENABLE ROW LEVEL SECURITY;
+ALTER TABLE custom_roles FORCE ROW LEVEL SECURITY;
+
+DROP POLICY IF EXISTS custom_roles_select ON custom_roles;
+CREATE POLICY custom_roles_select ON custom_roles
+  FOR SELECT USING (current_app_user_id() IS NOT NULL);
+
+DROP POLICY IF EXISTS custom_roles_write ON custom_roles;
+CREATE POLICY custom_roles_write ON custom_roles
+  FOR ALL USING (is_super_admin()) WITH CHECK (is_super_admin());
+
+-- ---------------------------------------------------------------------------
+-- client_members — who besides the workspace owner/admin/super admin can see
+-- and act on a client (and, transitively via is_client_member_for_project,
+-- every one of that client's engagements).
+-- ---------------------------------------------------------------------------
+ALTER TABLE client_members ENABLE ROW LEVEL SECURITY;
+ALTER TABLE client_members FORCE ROW LEVEL SECURITY;
+
+DROP POLICY IF EXISTS client_members_select ON client_members;
+CREATE POLICY client_members_select ON client_members
+  FOR SELECT USING (
+    is_workspace_admin(workspace_id)
+    OR user_id = current_app_user_id()
+    OR is_client_member(client_id) -- other members of the same client can see the roster
+  );
+
+DROP POLICY IF EXISTS client_members_insert ON client_members;
+CREATE POLICY client_members_insert ON client_members
+  FOR INSERT WITH CHECK (
+    is_workspace_admin(workspace_id)
+    OR has_workspace_permission(workspace_id, 'client.manage')
+    OR is_client_creator(client_id)
+    -- Invite acceptance bootstrap, same shape as project_members_insert's.
+    OR (user_id = current_app_user_id() AND has_pending_client_invite(client_id))
+  );
+
+DROP POLICY IF EXISTS client_members_delete ON client_members;
+CREATE POLICY client_members_delete ON client_members
+  FOR DELETE USING (
+    is_workspace_admin(workspace_id)
+    OR has_workspace_permission(workspace_id, 'client.manage')
+    OR is_client_creator(client_id)
+    OR user_id = current_app_user_id() -- self-removal
+  );
+
+-- ---------------------------------------------------------------------------
+-- project_custom_role_members — additive layer on top of project_members'
+-- built-in role. Same actor set as project_members' own policies.
+-- ---------------------------------------------------------------------------
+ALTER TABLE project_custom_role_members ENABLE ROW LEVEL SECURITY;
+ALTER TABLE project_custom_role_members FORCE ROW LEVEL SECURITY;
+
+DROP POLICY IF EXISTS project_custom_role_members_select ON project_custom_role_members;
+CREATE POLICY project_custom_role_members_select ON project_custom_role_members
+  FOR SELECT USING (
+    is_project_member(project_id)
+    OR is_workspace_admin(project_workspace_id(project_id))
+    OR user_id = current_app_user_id()
+  );
+
+DROP POLICY IF EXISTS project_custom_role_members_insert ON project_custom_role_members;
+CREATE POLICY project_custom_role_members_insert ON project_custom_role_members
+  FOR INSERT WITH CHECK (
+    is_workspace_admin(project_workspace_id(project_id))
+    OR has_project_permission(project_id, 'project.manage_members')
+    -- The accepting user's base project_members row is inserted in the same
+    -- transaction just before this one (see services/project-invitations.ts),
+    -- so is_project_member() is already true by the time this runs.
+    OR (user_id = current_app_user_id() AND is_project_member(project_id))
+  );
+
+DROP POLICY IF EXISTS project_custom_role_members_delete ON project_custom_role_members;
+CREATE POLICY project_custom_role_members_delete ON project_custom_role_members
+  FOR DELETE USING (
+    is_workspace_admin(project_workspace_id(project_id))
+    OR has_project_permission(project_id, 'project.manage_members')
+    OR user_id = current_app_user_id()
+  );
+
+-- ---------------------------------------------------------------------------
+-- task_members — one-task-only ACL. Anyone who could already write tasks in
+-- the project (or the workspace admin) can hand out a narrow grant; the
+-- grantee themselves can always see their own row and self-remove.
+-- ---------------------------------------------------------------------------
+ALTER TABLE task_members ENABLE ROW LEVEL SECURITY;
+ALTER TABLE task_members FORCE ROW LEVEL SECURITY;
+
+DROP POLICY IF EXISTS task_members_select ON task_members;
+CREATE POLICY task_members_select ON task_members
+  FOR SELECT USING (
+    is_workspace_admin(workspace_id)
+    OR user_id = current_app_user_id()
+    OR can_perform_on_project(
+      project_id, workspace_id,
+      (SELECT p.visibility FROM projects p WHERE p.id = project_id),
+      'task.write'
+    )
+  );
+
+DROP POLICY IF EXISTS task_members_insert ON task_members;
+CREATE POLICY task_members_insert ON task_members
+  FOR INSERT WITH CHECK (
+    is_workspace_admin(workspace_id)
+    OR has_project_permission(project_id, 'project.manage_members')
+    OR can_perform_on_project(
+      project_id, workspace_id,
+      (SELECT p.visibility FROM projects p WHERE p.id = project_id),
+      'task.write'
+    )
+    -- Invite acceptance bootstrap.
+    OR (user_id = current_app_user_id() AND has_pending_task_invite(task_id))
+  );
+
+DROP POLICY IF EXISTS task_members_delete ON task_members;
+CREATE POLICY task_members_delete ON task_members
+  FOR DELETE USING (
+    is_workspace_admin(workspace_id)
+    OR has_project_permission(project_id, 'project.manage_members')
+    OR user_id = current_app_user_id() -- self-removal
+  );
+
+-- ---------------------------------------------------------------------------
+-- client_invitations / task_invitations — same token/status/expiry shape and
+-- security posture as project_invitations above.
+-- ---------------------------------------------------------------------------
+ALTER TABLE client_invitations ENABLE ROW LEVEL SECURITY;
+ALTER TABLE client_invitations FORCE ROW LEVEL SECURITY;
+
+DROP POLICY IF EXISTS client_invitations_select ON client_invitations;
+CREATE POLICY client_invitations_select ON client_invitations
+  FOR SELECT USING (
+    inviter_id = current_app_user_id()
+    OR invitee_user_id = current_app_user_id()
+    OR is_workspace_admin(workspace_id)
+  );
+
+DROP POLICY IF EXISTS client_invitations_insert ON client_invitations;
+CREATE POLICY client_invitations_insert ON client_invitations
+  FOR INSERT WITH CHECK (
+    inviter_id = current_app_user_id()
+    AND (is_workspace_admin(workspace_id) OR is_client_member(client_id) OR is_client_creator(client_id))
+  );
+
+DROP POLICY IF EXISTS client_invitations_update ON client_invitations;
+CREATE POLICY client_invitations_update ON client_invitations
+  FOR UPDATE USING (
+    inviter_id = current_app_user_id()
+    OR invitee_user_id = current_app_user_id()
+    OR invitee_email = (SELECT u.email FROM users u WHERE u.id = current_app_user_id())
+    OR is_workspace_admin(workspace_id)
+  );
+
+ALTER TABLE task_invitations ENABLE ROW LEVEL SECURITY;
+ALTER TABLE task_invitations FORCE ROW LEVEL SECURITY;
+
+DROP POLICY IF EXISTS task_invitations_select ON task_invitations;
+CREATE POLICY task_invitations_select ON task_invitations
+  FOR SELECT USING (
+    inviter_id = current_app_user_id()
+    OR invitee_user_id = current_app_user_id()
+    OR is_workspace_admin(workspace_id)
+  );
+
+DROP POLICY IF EXISTS task_invitations_insert ON task_invitations;
+CREATE POLICY task_invitations_insert ON task_invitations
+  FOR INSERT WITH CHECK (
+    inviter_id = current_app_user_id()
+    AND (
+      is_workspace_admin(workspace_id)
+      OR has_project_permission(project_id, 'project.manage_members')
+      OR can_perform_on_project(
+        project_id, workspace_id,
+        (SELECT p.visibility FROM projects p WHERE p.id = project_id),
+        'task.write'
+      )
+    )
+  );
+
+DROP POLICY IF EXISTS task_invitations_update ON task_invitations;
+CREATE POLICY task_invitations_update ON task_invitations
+  FOR UPDATE USING (
+    inviter_id = current_app_user_id()
+    OR invitee_user_id = current_app_user_id()
+    OR invitee_email = (SELECT u.email FROM users u WHERE u.id = current_app_user_id())
+    OR is_workspace_admin(workspace_id)
+  );

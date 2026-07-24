@@ -108,9 +108,14 @@ export default function CreateProjectDialog({
   const queryClient = useQueryClient();
   const [name, setName] = useState("");
   const [description, setDescription] = useState("");
-  const [visibility, setVisibility] = useState<"PUBLIC_TO_WORKSPACE" | "PRIVATE_TO_MEMBERS">(
-    "PRIVATE_TO_MEMBERS"
-  );
+  // "Visible to everyone in this workspace" was removed from this picker —
+  // under the current access model (see db/rls-policies.sql's PART 2),
+  // workspace membership alone no longer grants visibility into an
+  // engagement, so PUBLIC_TO_WORKSPACE is a no-op. Every engagement is
+  // effectively PRIVATE_TO_MEMBERS now: access comes from being invited to
+  // it (or its client, or a specific task), being the workspace owner/admin,
+  // or being a super admin.
+  const visibility: "PRIVATE_TO_MEMBERS" = "PRIVATE_TO_MEMBERS";
   const [clientSelection, setClientSelection] = useState<string>(defaultClientId ?? NO_CLIENT);
   const [newClientName, setNewClientName] = useState("");
   const [engagementTypeId, setEngagementTypeId] = useState<string>(NO_ENGAGEMENT_TYPE);
@@ -253,15 +258,10 @@ export default function CreateProjectDialog({
             </div>
           )}
 
-          <Select value={visibility} onValueChange={(v) => setVisibility(v as typeof visibility)}>
-            <SelectTrigger>
-              <SelectValue />
-            </SelectTrigger>
-            <SelectContent>
-              <SelectItem value="PRIVATE_TO_MEMBERS">Private — only invited members</SelectItem>
-              <SelectItem value="PUBLIC_TO_WORKSPACE">Visible to everyone in this workspace</SelectItem>
-            </SelectContent>
-          </Select>
+          <p className="text-xs text-muted-foreground">
+            Only you, a workspace admin, or people you invite to this engagement (or its client)
+            will have access — collaborators are always added explicitly, never by default.
+          </p>
 
           {error && <p className="text-sm text-destructive">{error}</p>}
 

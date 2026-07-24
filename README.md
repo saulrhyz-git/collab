@@ -64,11 +64,15 @@ If you already had this app running, re-run steps 4 and 5 after pulling new code
 - `UPLOADS_DIR` — where per-engagement file uploads land on disk (default `./uploads`, gitignored).
 
 ```bash
-npm run db:push
+npx drizzle-kit push           # prefer this over `npm run db:push` — shows prompts a non-interactive run can silently skip
 psql "$DATABASE_URL" -f db/rls-policies.sql   # must be a superuser connection — see below
 ```
 
 `db:push` only adds what's new (it won't touch your existing rows), and `rls-policies.sql` is idempotent (`CREATE OR REPLACE FUNCTION`, `CREATE POLICY` guarded by the policies being dropped/recreated on each run) — safe to re-run any time the schema or policies change. Restart `npm run dev` afterward.
+
+**If a superadmin-only feature (permissions matrix, task templates, engagement types) suddenly starts 500ing after a pull**, the most likely cause is that the new tables never actually got created — `npx drizzle-kit push` run non-interactively can silently skip a prompt. Confirm with a one-off query (`SELECT 1 FROM permissions LIMIT 1;` etc.) and re-run `npx drizzle-kit push` interactively if it errors with "relation does not exist."
+
+**Picking up the custom roles / workspace isolation / superadmin user management enhancement** (see the section below) needs the same two commands run again — it adds `custom_roles`, `client_members`, `project_custom_role_members`, `task_members`, `client_invitations`, `task_invitations`, a `custom_role_id` column on `project_invitations`, and several new `users` columns (`contact_number`, `business_name`, `business_address`, `must_reset_password`). No new env vars for this one.
 
 **This one is not optional if you set up the app before this note was added.** Two real bugs in `db/rls-policies.sql` meant an ordinary (non-super-admin) account couldn't reliably sign up, log back in, or create a project — masked in earlier testing because everything was exercised through the seeded super admin, which bypasses both:
 
@@ -172,6 +176,47 @@ Inside a project, this shows up as two new views (see below): **References** (th
 
 `app/projects/[projectId]/project-shell.tsx` — now five views (Board, List, Gantt, References, AI Review), moved from a horizontal tab bar into a collapsible left sidebar (icon-only when collapsed) so the extra two views don't crowd a horizontal bar and the board/list/gantt content gets more width.
 
+## Custom roles, workspace isolation & superadmin user management
+
+A three-part enhancement layered on top of the RBAC matrix above, tightening who can see what by default and giving a super admin direct control over roles and accounts.
+
+### Workspace isolation rework
+
+Before this pass, any workspace member (`MEMBER`/`GUEST` role) could see every `PUBLIC_TO_WORKSPACE` client/project in their workspace automatically. That's gone: **plain workspace membership no longer implies visibility into anything.** The only paths to seeing a client, engagement, or task now are:
+
+- being the workspace's `OWNER` or an `ADMIN` (`is_workspace_admin()` — unchanged, deliberately retained as an oversight bypass so the person who runs the workspace, or someone they've explicitly made an admin, always sees everything in it), or a super admin;
+- an explicit grant: a `client_members` row (client-wide), a `project_members` row or `project_custom_role_members` row (one engagement), or a `task_members` row (one task only);
+- having created the client/project yourself (visibility for your own work, even before anyone else grants you anything).
+
+`PUBLIC_TO_WORKSPACE` project visibility still exists as a column (nothing was dropped) but no longer functions as a visibility grant — `can_access_project()`/`can_perform_on_project()` in `db/rls-policies.sql` (PART 2) no longer check it, and `components/CreateProjectDialog.tsx` no longer offers it as an option. `services/clients.ts` and `services/projects.ts` were reworked to match (`canAccessClient`/`canAccessProject` helpers replace the old "any workspace member sees it" shortcuts).
+
+### Custom roles
+
+A super admin can define named roles beyond the built-in `PROJECT_ADMIN`/`EDITOR`/`VIEWER` (`/admin/custom-roles`), each scoped either:
+
+- **PROJECT** — granted on one engagement at a time (`project_custom_role_members`, an *additive* layer on top of a `project_members` row — it doesn't replace or require changing the built-in role column), or
+- **CLIENT** — granted once (`client_members`) and applying across every engagement under that client at once.
+
+A custom role's actual grants are **not** a separate simplified Full-Access/View/Edit/Delete preset system — they plug into the exact same `role_permissions` matrix the built-in roles use (`services/permissions.ts`'s `getPermissionMatrix`, `/admin/permissions`): a custom role shows up there as an extra column (in *italics*, with "(client-wide)" on CLIENT-scoped ones) next to the built-ins, keyed by the role's id instead of a fixed name. RLS reads the same table via new `has_client_permission()`/`has_project_custom_role_permission()` functions.
+
+### Task-level ACL
+
+Genuinely new, not just a filtered engagement view: `task_members` grants one person `VIEWER` or `EDITOR` on **exactly one task**, with zero visibility into the rest of that engagement's backlog. Deliberately simple (two levels, no matrix) since the ask was narrow one-task sharing. Reachable from the task detail panel's new "Share" button (`components/TaskCollaboratorsModal.tsx`).
+
+### Invitations
+
+Three parallel invitation flows now exist, all sharing the same sha256-token/7-day-expiry/replay-safe-acceptance shape as the original project invite flow:
+
+- `services/invitations.ts` — engagement invites, optionally carrying a PROJECT-scoped `customRoleId` layered on at acceptance.
+- `services/client-invitations.ts` — client-wide invites, carrying a required CLIENT-scoped `customRoleId`.
+- `services/task-invitations.ts` — single-task invites, carrying a `VIEWER`/`EDITOR` role.
+
+`app/api/invites/accept/route.ts`'s single accept endpoint tries all three lookups in turn (a raw token doesn't carry a marker for which table it belongs to) since the accept link is the same shape for all three.
+
+### Superadmin "add user" facility
+
+`/admin/users` — a super admin can create an account directly, with a **temporary password they type in themselves** (not auto-generated-and-emailed) shown back once for them to relay out-of-band; the account is flagged `must_reset_password` for future UI to act on. Required fields: full name, contact number, email, account-level role (User / Super admin — not a client/project custom role, which is assigned separately via an invite once the account exists). Optional: business name, business address. Every new account still gets its own PERSONAL workspace, same as self-serve signup — under the isolation model above, it simply starts with zero access to anyone else's clients/engagements until invited. `services/users-admin.ts`'s `createUserBySuperAdmin` deliberately does **not** touch `app.current_user_id` mid-transaction the way `auth/signup.ts` does (that would leak the new user's identity into the rest of the acting superadmin's request) — it doesn't need to, since `is_super_admin()` already shortcuts both bootstrap RLS checks the new workspace/membership rows need.
+
 ## File map
 
 - `db/schema.ts` — Drizzle schema: workspaces, clients, projects, tasks (+ subtasks + dependencies + comments), memberships, invitations, activity log.
@@ -195,17 +240,21 @@ Inside a project, this shows up as two new views (see below): **References** (th
 - `services/smtp-settings.ts`, `services/ai-provider-settings.ts` — superadmin-managed platform settings; secrets encrypted via `lib/crypto-secrets.ts`.
 - `services/project-files.ts` — per-engagement file upload/list/download/delete, local-disk storage via `lib/file-storage.ts`.
 - `services/ai-review.ts` — the "Review via AI" action; text extraction via `lib/document-text-extraction.ts`, provider calls via `openai`/`@google/generative-ai`.
+- `services/custom-roles.ts` — CRUD for named PROJECT/CLIENT-scoped roles (superadmin-only writes); deleting one also clears its `role_permissions` rows.
+- `services/client-members.ts`, `services/project-custom-role-members.ts`, `services/task-members.ts` — direct (non-invite) grant/revoke for client-wide, engagement-level-custom-role, and single-task access respectively.
+- `services/client-invitations.ts`, `services/task-invitations.ts` — by-email invite flows mirroring `services/invitations.ts`'s token/expiry/acceptance shape, for client-wide and single-task access.
+- `services/users-admin.ts` — `createUserBySuperAdmin`, `listAllUsers`, `setUserSuperAdminRole` — the superadmin "add user" facility.
 - `scripts/seed-superadmin.ts` — creates/promotes the super admin account from `.env`.
-- `app/api/**/route.ts` — Next.js route handlers wiring the above into HTTP, including `app/api/admin/**` (permissions, task templates, engagement types, SMTP/AI settings — all superadmin-gated) and `app/api/projects/[projectId]/files/**` (uploads, download, delete, promote, AI review).
-- `app/dashboard-shell.tsx` — the post-login landing page: stats, my tasks, upcoming deadlines, recent activity, clients/engagements roster, and a superadmin-only "Admin" menu (permissions matrix, task templates, engagement types, SMTP settings, AI provider settings).
-- `app/admin/**` — superadmin-only pages: permissions matrix, task template builder, engagement type builder, SMTP settings, AI provider settings.
+- `app/api/**/route.ts` — Next.js route handlers wiring the above into HTTP, including `app/api/admin/**` (permissions, task templates, engagement types, SMTP/AI settings, custom roles, users — all superadmin-gated), `app/api/projects/[projectId]/files/**` (uploads, download, delete, promote, AI review), `app/api/projects/[projectId]/custom-role-members/**` and `.../tasks/[taskId]/members|invitations/**`, and `app/api/clients/[clientId]/members|invitations/**`.
+- `app/dashboard-shell.tsx` — the post-login landing page: stats, my tasks, upcoming deadlines, recent activity, clients/engagements roster, and a superadmin-only "Admin" menu (permissions matrix, custom roles, users, task templates, engagement types, SMTP settings, AI provider settings).
+- `app/admin/**` — superadmin-only pages: permissions matrix, custom roles, users, task template builder, engagement type builder, SMTP settings, AI provider settings.
 - `app/projects/[projectId]/` — project detail page and the collapsible-sidebar view shell (Board/List/Gantt/References/AI Review).
-- `app/clients/[clientId]/` — client detail page (contact info, notes, engagements).
+- `app/clients/[clientId]/` — client detail page (contact info, notes, engagements, collaborators).
 - `lib/format-activity.ts` — turns an activity-log row into a human sentence for the recent-activity feed.
 - `lib/crypto-secrets.ts` — AES-256-GCM encrypt/decrypt for secrets at rest (`ENCRYPTION_KEY`).
 - `lib/file-storage.ts` — local-disk file storage helpers (`UPLOADS_DIR`).
 - `lib/document-text-extraction.ts` — PDF/Word/text extraction for the AI review flow.
-- `components/*.tsx` — WorkspaceSelector, ProjectCollaboratorModal, KanbanBoard, TaskListView, GanttChart, TaskDetailPanel, CreateProjectDialog, CreateClientDialog, ApplyTemplateDialog, ReferencesTab, AiReviewTab, plus the shadcn/ui primitives under `components/ui/`.
+- `components/*.tsx` — WorkspaceSelector, ProjectCollaboratorModal, ClientCollaboratorsModal, TaskCollaboratorsModal, KanbanBoard, TaskListView, GanttChart, TaskDetailPanel, CreateProjectDialog, CreateClientDialog, ApplyTemplateDialog, ReferencesTab, AiReviewTab, plus the shadcn/ui primitives under `components/ui/`.
 - `realtime/socket-server.ts` — Socket.io server with room-based project isolation.
 
 ## Step 5: Security & edge cases

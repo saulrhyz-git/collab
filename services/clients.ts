@@ -1,6 +1,14 @@
 import { eq, and, isNull, desc } from "drizzle-orm";
 import { db } from "../db/client";
-import { clients, projects, projectMembers, workspaceMembers, activityLogs } from "../db/schema";
+import {
+  clients,
+  clientMembers,
+  projects,
+  projectMembers,
+  projectCustomRoleMembers,
+  workspaceMembers,
+  activityLogs,
+} from "../db/schema";
 import { isSuperAdmin } from "../auth/super-admin";
 import { userHasWorkspacePermission } from "./permissions";
 
@@ -13,6 +21,36 @@ async function isWorkspaceMember(workspaceId: string, userId: string) {
     where: and(eq(workspaceMembers.workspaceId, workspaceId), eq(workspaceMembers.userId, userId)),
   });
   return !!m;
+}
+
+/** Structural bypass mirroring RLS's is_workspace_admin() — OWNER/ADMIN role or super admin, retained as an oversight mechanism (see db/rls-policies.sql's PART 2 comment). */
+async function isWorkspaceAdmin(workspaceId: string, userId: string) {
+  if (await isSuperAdmin(userId)) return true;
+  const m = await db.query.workspaceMembers.findFirst({
+    where: and(eq(workspaceMembers.workspaceId, workspaceId), eq(workspaceMembers.userId, userId)),
+  });
+  return m?.role === "OWNER" || m?.role === "ADMIN";
+}
+
+function isClientMemberRow(clientId: string, userId: string) {
+  return db.query.clientMembers.findFirst({
+    where: and(eq(clientMembers.clientId, clientId), eq(clientMembers.userId, userId)),
+  });
+}
+
+/**
+ * Mirrors clients_select in db/rls-policies.sql (PART 2): plain workspace
+ * membership no longer implies visibility into a client — the workspace
+ * owner/admin, whoever created the record, or an explicit client_members
+ * grant are the only paths in.
+ */
+async function canAccessClient(
+  client: { id: string; workspaceId: string; createdBy: string },
+  userId: string
+): Promise<boolean> {
+  if (client.createdBy === userId) return true;
+  if (await isWorkspaceAdmin(client.workspaceId, userId)) return true;
+  return !!(await isClientMemberRow(client.id, userId));
 }
 
 async function getWorkspaceRole(workspaceId: string, userId: string) {
@@ -76,16 +114,33 @@ export async function createClient(params: {
   return client;
 }
 
-/** Non-archived clients in a workspace, for the "which client is this engagement for" picker and the dashboard's grouped view. */
+/**
+ * Non-archived clients in a workspace the caller can actually see, for the
+ * "which client is this engagement for" picker and the dashboard's grouped
+ * view. Workspace membership alone no longer implies visibility (see
+ * canAccessClient) — a workspace admin/owner/super admin sees every client;
+ * anyone else only sees clients they created or hold an explicit
+ * client_members grant for.
+ */
 export async function listClientsForWorkspace(workspaceId: string, requestingUserId: string) {
   if (!(await isWorkspaceMember(workspaceId, requestingUserId))) {
     throw new NotAuthorizedError("You are not a member of this workspace.");
   }
 
-  return db.query.clients.findMany({
+  const all = await db.query.clients.findMany({
     where: and(eq(clients.workspaceId, workspaceId), isNull(clients.archivedAt)),
     orderBy: (c, { asc }) => [asc(c.name)],
   });
+
+  if (await isWorkspaceAdmin(workspaceId, requestingUserId)) return all;
+
+  const memberships = await db.query.clientMembers.findMany({
+    where: eq(clientMembers.userId, requestingUserId),
+    columns: { clientId: true },
+  });
+  const memberClientIds = new Set(memberships.map((m) => m.clientId));
+
+  return all.filter((c) => c.createdBy === requestingUserId || memberClientIds.has(c.id));
 }
 
 /** A client plus every engagement (project) on record for them — the client detail page's single data source. */
@@ -93,29 +148,42 @@ export async function getClient(clientId: string, requestingUserId: string) {
   const client = await db.query.clients.findFirst({ where: eq(clients.id, clientId) });
   if (!client) throw new NotFoundError("Client not found.");
 
-  if (!(await isWorkspaceMember(client.workspaceId, requestingUserId))) {
+  if (!(await canAccessClient(client, requestingUserId))) {
     throw new NotAuthorizedError("You don't have access to this client.");
   }
 
   const isSuper = await isSuperAdmin(requestingUserId);
+  const isAdmin = await isWorkspaceAdmin(client.workspaceId, requestingUserId);
   const allEngagements = await db.query.projects.findMany({
     where: and(eq(projects.clientId, clientId), isNull(projects.archivedAt)),
     orderBy: [desc(projects.createdAt)],
   });
 
   let engagements = allEngagements;
-  if (!isSuper) {
-    // Same visibility rule as listProjectsForWorkspace: a PUBLIC_TO_WORKSPACE
-    // engagement shows for any workspace member; a PRIVATE_TO_MEMBERS one
-    // only if the caller has an explicit project_members row.
-    const memberships = await db.query.projectMembers.findMany({
-      where: eq(projectMembers.userId, requestingUserId),
-      columns: { projectId: true },
-    });
-    const memberProjectIds = new Set(memberships.map((m) => m.projectId));
-    engagements = allEngagements.filter(
-      (p) => p.visibility === "PUBLIC_TO_WORKSPACE" || memberProjectIds.has(p.id)
-    );
+  if (!isSuper && !isAdmin) {
+    // Mirrors can_access_project in db/rls-policies.sql (PART 2):
+    // PUBLIC_TO_WORKSPACE no longer grants anything — visibility requires a
+    // direct project_members row, a project-scoped custom role, or (since
+    // the caller already passed canAccessClient above via a client_members
+    // grant) implicit access to every one of this client's engagements.
+    const viaClientMembership = await isClientMemberRow(clientId, requestingUserId);
+    if (!viaClientMembership) {
+      const [memberships, customRoleMemberships] = await Promise.all([
+        db.query.projectMembers.findMany({
+          where: eq(projectMembers.userId, requestingUserId),
+          columns: { projectId: true },
+        }),
+        db.query.projectCustomRoleMembers.findMany({
+          where: eq(projectCustomRoleMembers.userId, requestingUserId),
+          columns: { projectId: true },
+        }),
+      ]);
+      const visibleProjectIds = new Set([
+        ...memberships.map((m) => m.projectId),
+        ...customRoleMemberships.map((m) => m.projectId),
+      ]);
+      engagements = allEngagements.filter((p) => visibleProjectIds.has(p.id));
+    }
   }
 
   return { ...client, engagements };
