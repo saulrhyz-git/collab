@@ -17,6 +17,7 @@ import {
 } from "@/components/ui/select";
 import { Avatar, AvatarFallback, AvatarImage } from "@/components/ui/avatar";
 import TaskCollaboratorsModal from "@/components/TaskCollaboratorsModal";
+import { cn } from "@/lib/utils";
 
 type TaskStatus = "BACKLOG" | "TODO" | "IN_PROGRESS" | "IN_REVIEW" | "DONE" | "ARCHIVED";
 type TaskPriority = "LOW" | "MEDIUM" | "HIGH" | "URGENT";
@@ -46,6 +47,13 @@ interface Comment {
   authorAvatar?: string | null;
 }
 
+interface ChecklistItem {
+  id: string;
+  title: string;
+  remarks: string | null;
+  completed: boolean;
+}
+
 interface ProjectMember {
   userId: string;
   fullName: string;
@@ -60,6 +68,12 @@ async function fetchTask(projectId: string, taskId: string): Promise<TaskDetail>
 async function fetchComments(projectId: string, taskId: string): Promise<Comment[]> {
   const res = await fetch(`/api/projects/${projectId}/tasks/${taskId}/comments`, { credentials: "include" });
   if (!res.ok) throw new Error("Failed to load comments");
+  return res.json();
+}
+
+async function fetchChecklist(projectId: string, taskId: string): Promise<ChecklistItem[]> {
+  const res = await fetch(`/api/projects/${projectId}/tasks/${taskId}/checklist`, { credentials: "include" });
+  if (!res.ok) throw new Error("Failed to load checklist");
   return res.json();
 }
 
@@ -110,6 +124,10 @@ export default function TaskDetailPanel({
     queryKey: ["tasks", projectId],
     queryFn: () => fetchProjectTasks(projectId),
   });
+  const { data: checklist = [] } = useQuery({
+    queryKey: ["task-checklist", taskId],
+    queryFn: () => fetchChecklist(projectId, taskId),
+  });
 
   const [title, setTitle] = useState("");
   const [description, setDescription] = useState("");
@@ -117,6 +135,9 @@ export default function TaskDetailPanel({
   const [addingDependency, setAddingDependency] = useState(false);
   const [dependencyTaskId, setDependencyTaskId] = useState("");
   const [collaboratorsOpen, setCollaboratorsOpen] = useState(false);
+  const [addingChecklistItem, setAddingChecklistItem] = useState(false);
+  const [newItemTitle, setNewItemTitle] = useState("");
+  const [newItemRemarks, setNewItemRemarks] = useState("");
 
   useEffect(() => {
     if (task) {
@@ -186,6 +207,49 @@ export default function TaskDetailPanel({
         credentials: "include",
       }),
     onSuccess: invalidateTask,
+  });
+
+  function invalidateChecklist() {
+    queryClient.invalidateQueries({ queryKey: ["task-checklist", taskId] });
+  }
+
+  const addChecklistItemMutation = useMutation({
+    mutationFn: (body: { title: string; remarks: string | null }) =>
+      fetch(`/api/projects/${projectId}/tasks/${taskId}/checklist`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+        credentials: "include",
+      }).then((res) => {
+        if (!res.ok) throw new Error("Failed to add checklist item");
+        return res.json();
+      }),
+    onSuccess: () => {
+      setNewItemTitle("");
+      setNewItemRemarks("");
+      setAddingChecklistItem(false);
+      invalidateChecklist();
+    },
+  });
+
+  const toggleChecklistItemMutation = useMutation({
+    mutationFn: ({ itemId, completed }: { itemId: string; completed: boolean }) =>
+      fetch(`/api/projects/${projectId}/tasks/${taskId}/checklist/${itemId}`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ completed }),
+        credentials: "include",
+      }),
+    onSuccess: invalidateChecklist,
+  });
+
+  const deleteChecklistItemMutation = useMutation({
+    mutationFn: (itemId: string) =>
+      fetch(`/api/projects/${projectId}/tasks/${taskId}/checklist/${itemId}`, {
+        method: "DELETE",
+        credentials: "include",
+      }),
+    onSuccess: invalidateChecklist,
   });
 
   if (!task) return null;
@@ -309,6 +373,110 @@ export default function TaskDetailPanel({
             </div>
           </div>
         )}
+
+        <div>
+          <div className="mb-1 flex items-center justify-between">
+            <p className="text-xs font-medium text-muted-foreground">
+              Checklist
+              {checklist.length > 0 && (
+                <span className="ml-1 text-muted-foreground/70">
+                  ({checklist.filter((i) => i.completed).length}/{checklist.length})
+                </span>
+              )}
+            </p>
+            {canEdit && !addingChecklistItem && (
+              <Button variant="ghost" size="sm" className="h-6 px-1.5" onClick={() => setAddingChecklistItem(true)}>
+                <Plus className="h-3.5 w-3.5" />
+              </Button>
+            )}
+          </div>
+
+          {checklist.length > 0 && (
+            <div className="mb-2 space-y-1">
+              {checklist.map((item) => (
+                <div key={item.id} className="flex items-start gap-2 rounded border px-2 py-1.5">
+                  <input
+                    type="checkbox"
+                    className="mt-0.5 h-4 w-4 shrink-0 cursor-pointer accent-gold disabled:cursor-not-allowed"
+                    checked={item.completed}
+                    disabled={!canEdit}
+                    onChange={(e) =>
+                      toggleChecklistItemMutation.mutate({ itemId: item.id, completed: e.target.checked })
+                    }
+                  />
+                  <div className="min-w-0 flex-1">
+                    <p className={cn("truncate text-sm", item.completed && "text-muted-foreground line-through")}>
+                      {item.title}
+                    </p>
+                    {item.remarks && (
+                      <p className="whitespace-pre-wrap break-words text-xs text-muted-foreground">{item.remarks}</p>
+                    )}
+                  </div>
+                  {canEdit && (
+                    <Button
+                      variant="ghost"
+                      size="icon"
+                      className="h-6 w-6 shrink-0"
+                      onClick={() => deleteChecklistItemMutation.mutate(item.id)}
+                    >
+                      <Trash2 className="h-3.5 w-3.5" />
+                    </Button>
+                  )}
+                </div>
+              ))}
+            </div>
+          )}
+
+          {addingChecklistItem && (
+            <form
+              className="mb-2 space-y-1.5 rounded border p-2"
+              onSubmit={(e) => {
+                e.preventDefault();
+                if (newItemTitle.trim()) {
+                  addChecklistItemMutation.mutate({
+                    title: newItemTitle.trim(),
+                    remarks: newItemRemarks.trim() || null,
+                  });
+                }
+              }}
+            >
+              <Input
+                autoFocus
+                placeholder="Item title"
+                value={newItemTitle}
+                onChange={(e) => setNewItemTitle(e.target.value)}
+                className="h-8"
+              />
+              <Textarea
+                placeholder="Remarks (optional)"
+                value={newItemRemarks}
+                onChange={(e) => setNewItemRemarks(e.target.value)}
+                rows={2}
+              />
+              <div className="flex justify-end gap-1.5">
+                <Button
+                  type="button"
+                  variant="ghost"
+                  size="sm"
+                  onClick={() => {
+                    setAddingChecklistItem(false);
+                    setNewItemTitle("");
+                    setNewItemRemarks("");
+                  }}
+                >
+                  Cancel
+                </Button>
+                <Button type="submit" size="sm" disabled={!newItemTitle.trim() || addChecklistItemMutation.isPending}>
+                  Add item
+                </Button>
+              </div>
+            </form>
+          )}
+
+          {checklist.length === 0 && !addingChecklistItem && (
+            <p className="text-sm text-muted-foreground">No checklist items yet.</p>
+          )}
+        </div>
 
         <div>
           <div className="mb-1 flex items-center justify-between">

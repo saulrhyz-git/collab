@@ -327,6 +327,36 @@ export const taskComments = pgTable("task_comments", {
 }));
 
 // ---------------------------------------------------------------------------
+// task_checklist_items — a lightweight punch-list inside a task: a checkbox,
+// a short title, and an optional free-text remark. Deliberately separate
+// from the parent/child `tasks` self-reference above (the "Subtasks"
+// section) — that's for real linked tasks with their own status/assignee/
+// dependencies; this is for a quick "things to verify before this is done"
+// list that doesn't need to be a first-class task itself.
+// ---------------------------------------------------------------------------
+
+export const taskChecklistItems = pgTable("task_checklist_items", {
+  id: uuid("id").primaryKey().defaultRandom(),
+  taskId: uuid("task_id").notNull().references(() => tasks.id, { onDelete: "cascade" }),
+  title: varchar("title", { length: 300 }).notNull(),
+  remarks: text("remarks"),
+  completed: boolean("completed").notNull().default(false),
+  // Same fractional-index convention as tasks.position — avoids rewriting
+  // every row in the list on a reorder.
+  position: doublePrecision("position").notNull().default(0),
+  createdBy: uuid("created_by").notNull().references(() => users.id),
+  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+  updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
+}, (t) => ({
+  taskPositionIdx: index("task_checklist_items_task_position_idx").on(t.taskId, t.position),
+}));
+
+export const taskChecklistItemsRelations = relations(taskChecklistItems, ({ one }) => ({
+  task: one(tasks, { fields: [taskChecklistItems.taskId], references: [tasks.id] }),
+  creator: one(users, { fields: [taskChecklistItems.createdBy], references: [users.id] }),
+}));
+
+// ---------------------------------------------------------------------------
 // activity_logs
 // ---------------------------------------------------------------------------
 
@@ -403,6 +433,7 @@ export const tasksRelations = relations(tasks, ({ one, many }) => ({
   parentTask: one(tasks, { fields: [tasks.parentTaskId], references: [tasks.id], relationName: "subtasks" }),
   subtasks: many(tasks, { relationName: "subtasks" }),
   comments: many(taskComments),
+  checklistItems: many(taskChecklistItems),
   dependenciesAsPredecessor: many(taskDependencies, { relationName: "predecessor" }),
   dependenciesAsSuccessor: many(taskDependencies, { relationName: "successor" }),
   members: many(taskMembers),
@@ -800,6 +831,7 @@ export type ProjectInvitation = typeof projectInvitations.$inferSelect;
 export type Task = typeof tasks.$inferSelect;
 export type TaskDependency = typeof taskDependencies.$inferSelect;
 export type TaskComment = typeof taskComments.$inferSelect;
+export type TaskChecklistItem = typeof taskChecklistItems.$inferSelect;
 export type ActivityLog = typeof activityLogs.$inferSelect;
 export type Permission = typeof permissions.$inferSelect;
 export type RolePermission = typeof rolePermissions.$inferSelect;

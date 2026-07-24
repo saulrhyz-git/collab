@@ -16,6 +16,9 @@ const createTaskSchema = z.object({
   parentTaskId: z.string().uuid().nullable().optional(),
   startDate: z.coerce.date().nullable().optional(),
   dueDate: z.coerce.date().nullable().optional(),
+  // Which column a board quick-add landed in — omitted (defaults to
+  // BACKLOG) for the List view's quick-add.
+  status: z.enum(["BACKLOG", "TODO", "IN_PROGRESS", "IN_REVIEW", "DONE", "ARCHIVED"]).optional(),
 });
 
 export const GET = withAuth(async (_req, userId, params) => {

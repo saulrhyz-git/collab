@@ -221,6 +221,14 @@ Three parallel invitation flows now exist, all sharing the same sha256-token/7-d
 
 `/admin/users` — a super admin can create an account directly, with a **temporary password they type in themselves** (not auto-generated-and-emailed) shown back once for them to relay out-of-band; the account is flagged `must_reset_password` for future UI to act on. Required fields: full name, contact number, email, account-level role (User / Super admin — not a client/project custom role, which is assigned separately via an invite once the account exists). Optional: business name, business address. Every new account still gets its own PERSONAL workspace, same as self-serve signup — under the isolation model above, it simply starts with zero access to anyone else's clients/engagements until invited. `services/users-admin.ts`'s `createUserBySuperAdmin` deliberately does **not** touch `app.current_user_id` mid-transaction the way `auth/signup.ts` does (that would leak the new user's identity into the rest of the acting superadmin's request) — it doesn't need to, since `is_super_admin()` already shortcuts both bootstrap RLS checks the new workspace/membership rows need.
 
+## Board/list view quick-add, Backlog ordering, and task checklists
+
+Three small task-management fixes:
+
+- **Add a task directly from the board.** Each Kanban column now has its own "Add task" quick-add form (`components/KanbanBoard.tsx`), matching the one List view already had — it posts straight into that column's status rather than always landing in Backlog. `createTask` (`services/tasks.ts`) and the `POST /api/projects/:projectId/tasks` route both gained an optional `status` field for this; List view's quick-add still omits it and gets the old BACKLOG default.
+- **Backlog now sorts first in List view**, not last — just a reorder of the `GROUPS` array in `components/TaskListView.tsx`.
+- **Task checklists** — a lightweight punch-list inside a task (checkbox + short title + optional free-text remarks), separate from the existing "Subtasks" section (which links real child tasks with their own status/assignee). New `task_checklist_items` table (`db/schema.ts`); RLS mirrors `task_comments`' visibility (task-level access via a `task_members` grant or project `tasks.view`) but gates every write — add, toggle-complete, edit, delete — by a single `tasks.edit` check, the same bar as editing the task's own title or description, since there's no meaningful create/toggle/delete split here. `services/task-checklist.ts` (list/add/update/delete) and `app/api/projects/[projectId]/tasks/[taskId]/checklist/**` wire it up; `components/TaskDetailPanel.tsx` renders it as its own "Checklist" section with a completed-count badge, inline add form, and per-item checkbox/delete.
+
 ## File map
 
 - `db/schema.ts` — Drizzle schema: workspaces, clients, projects, tasks (+ subtasks + dependencies + comments), memberships, invitations, activity log.
@@ -235,6 +243,7 @@ Three parallel invitation flows now exist, all sharing the same sha256-token/7-d
 - `services/tasks.ts` — CRUD plus `getTaskDetail` (task + assignee + reporter + subtasks + dependency edges in one call).
 - `services/task-dependencies.ts` — add/remove dependency, cycle detection.
 - `services/task-comments.ts` — list/add/delete comments.
+- `services/task-checklist.ts` — list/add/update (toggle-complete or edit)/delete checklist items, gated by `tasks.edit`.
 - `services/dashboard.ts` — `getWorkspaceDashboard`, the landing page's single aggregate query.
 - `services/invitations.ts` — `sendProjectInvite`, `acceptProjectInvite`, `revokeProjectInvite`.
 - `services/workspace-members.ts` — `removeWorkspaceMember`, with task-reassignment handling.

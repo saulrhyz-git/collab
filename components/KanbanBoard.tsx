@@ -1,7 +1,7 @@
 "use client";
 
 import { useEffect, useMemo, useState, useCallback } from "react";
-import { useQuery, useQueryClient } from "@tanstack/react-query";
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   DndContext,
   DragEndEvent,
@@ -19,9 +19,12 @@ import {
 } from "@dnd-kit/sortable";
 import { CSS } from "@dnd-kit/utilities";
 import { io, Socket } from "socket.io-client";
+import { Plus } from "lucide-react";
 import { Badge } from "@/components/ui/badge";
 import { Card, CardContent } from "@/components/ui/card";
 import { Avatar, AvatarFallback, AvatarImage } from "@/components/ui/avatar";
+import { Input } from "@/components/ui/input";
+import { Button } from "@/components/ui/button";
 
 type TaskStatus = "BACKLOG" | "TODO" | "IN_PROGRESS" | "IN_REVIEW" | "DONE";
 type TaskPriority = "LOW" | "MEDIUM" | "HIGH" | "URGENT";
@@ -53,6 +56,17 @@ const PRIORITY_COLOR: Record<TaskPriority, string> = {
 async function fetchTasks(projectId: string): Promise<TaskCard[]> {
   const res = await fetch(`/api/projects/${projectId}/tasks`, { credentials: "include" });
   if (!res.ok) throw new Error("Failed to load tasks");
+  return res.json();
+}
+
+async function createTaskInColumn(projectId: string, title: string, status: TaskStatus) {
+  const res = await fetch(`/api/projects/${projectId}/tasks`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ title, status }),
+    credentials: "include",
+  });
+  if (!res.ok) throw new Error("Failed to create task");
   return res.json();
 }
 
@@ -92,10 +106,21 @@ export default function KanbanBoard({
   const queryClient = useQueryClient();
   const [activeTask, setActiveTask] = useState<TaskCard | null>(null);
   const [socket, setSocket] = useState<Socket | null>(null);
+  const [quickAddColumn, setQuickAddColumn] = useState<TaskStatus | null>(null);
+  const [quickAddTitle, setQuickAddTitle] = useState("");
 
   const { data: tasks = [] } = useQuery({
     queryKey: ["tasks", projectId],
     queryFn: () => fetchTasks(projectId),
+  });
+
+  const createMutation = useMutation({
+    mutationFn: (status: TaskStatus) => createTaskInColumn(projectId, quickAddTitle.trim(), status),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ["tasks", projectId] });
+      setQuickAddTitle("");
+      setQuickAddColumn(null);
+    },
   });
 
   // --- Realtime: reflect moves made by other collaborators instantly ---
@@ -181,6 +206,18 @@ export default function KanbanBoard({
             label={col.label}
             tasks={columns.get(col.id) ?? []}
             onTaskClick={onTaskClick}
+            quickAddOpen={quickAddColumn === col.id}
+            quickAddTitle={quickAddTitle}
+            quickAddPending={createMutation.isPending}
+            onQuickAddOpen={() => setQuickAddColumn(col.id)}
+            onQuickAddTitleChange={setQuickAddTitle}
+            onQuickAddCancel={() => {
+              setQuickAddColumn(null);
+              setQuickAddTitle("");
+            }}
+            onQuickAddSubmit={() => {
+              if (quickAddTitle.trim()) createMutation.mutate(col.id);
+            }}
           />
         ))}
       </div>
@@ -194,11 +231,25 @@ function KanbanColumn({
   label,
   tasks,
   onTaskClick,
+  quickAddOpen,
+  quickAddTitle,
+  quickAddPending,
+  onQuickAddOpen,
+  onQuickAddTitleChange,
+  onQuickAddCancel,
+  onQuickAddSubmit,
 }: {
   status: TaskStatus;
   label: string;
   tasks: TaskCard[];
   onTaskClick?: (taskId: string) => void;
+  quickAddOpen: boolean;
+  quickAddTitle: string;
+  quickAddPending: boolean;
+  onQuickAddOpen: () => void;
+  onQuickAddTitleChange: (title: string) => void;
+  onQuickAddCancel: () => void;
+  onQuickAddSubmit: () => void;
 }) {
   return (
     <div className="w-72 shrink-0 rounded-lg bg-muted/50 p-2">
@@ -213,6 +264,38 @@ function KanbanColumn({
           ))}
         </div>
       </SortableContext>
+
+      <div className="mt-2 px-1">
+        {quickAddOpen ? (
+          <form
+            className="flex items-center gap-1.5"
+            onSubmit={(e) => {
+              e.preventDefault();
+              onQuickAddSubmit();
+            }}
+          >
+            <Input
+              autoFocus
+              value={quickAddTitle}
+              onChange={(e) => onQuickAddTitleChange(e.target.value)}
+              onBlur={() => !quickAddTitle && onQuickAddCancel()}
+              placeholder="Task name"
+              className="h-8 bg-background"
+            />
+            <Button type="submit" size="sm" disabled={quickAddPending}>
+              Add
+            </Button>
+          </form>
+        ) : (
+          <button
+            onClick={onQuickAddOpen}
+            className="flex w-full items-center gap-1.5 rounded px-1.5 py-1.5 text-left text-sm text-muted-foreground hover:bg-accent/50"
+          >
+            <Plus className="h-3.5 w-3.5" />
+            Add task
+          </button>
+        )}
+      </div>
     </div>
   );
 }

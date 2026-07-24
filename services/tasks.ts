@@ -121,6 +121,8 @@ export async function createTask(params: {
   parentTaskId?: string | null;
   startDate?: Date | null;
   dueDate?: Date | null;
+  /** Which column a board quick-add landed in — defaults to BACKLOG (List view's quick-add, and anyone not on the board). */
+  status?: TaskStatus;
 }) {
   const project = await getProjectOrThrow(params.projectId);
   if (!(await canPerform(params.reporterId, params.projectId, "tasks.create"))) {
@@ -155,7 +157,7 @@ export async function createTask(params: {
       workspaceId: project.workspaceId,
       title: params.title.trim(),
       description: params.description,
-      status: "BACKLOG",
+      status: params.status ?? "BACKLOG",
       priority: params.priority ?? "MEDIUM",
       assigneeId: params.assigneeId ?? null,
       parentTaskId: params.parentTaskId ?? null,

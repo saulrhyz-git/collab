@@ -23,11 +23,11 @@ interface TaskRow {
 }
 
 const GROUPS: { id: TaskStatus; label: string }[] = [
+  { id: "BACKLOG", label: "Backlog" },
   { id: "TODO", label: "To Do" },
   { id: "IN_PROGRESS", label: "In Progress" },
   { id: "IN_REVIEW", label: "In Review" },
   { id: "DONE", label: "Done" },
-  { id: "BACKLOG", label: "Backlog" },
 ];
 
 const PRIORITY_COLOR: Record<TaskPriority, string> = {

@@ -1296,6 +1296,43 @@ CREATE POLICY task_dependencies_write ON task_dependencies
   );
 
 -- ---------------------------------------------------------------------------
+-- task_checklist_items — a lightweight punch-list inside a task (checkbox +
+-- title + optional remarks), distinct from the tasks table's own
+-- parent/child self-reference (the "Subtasks" section — real linked tasks
+-- with their own status/assignee). Visibility mirrors task_comments_select
+-- (a task_members grant, or project-level tasks.view); every write (add,
+-- toggle-complete, edit remarks, delete) is gated by a single tasks.edit
+-- check — same bar as editing the task's own title/description — since
+-- there's no create/toggle/delete distinction meaningful enough to split,
+-- same reasoning as task_dependencies_write below it.
+-- ---------------------------------------------------------------------------
+ALTER TABLE task_checklist_items ENABLE ROW LEVEL SECURITY;
+ALTER TABLE task_checklist_items FORCE ROW LEVEL SECURITY;
+
+DROP POLICY IF EXISTS task_checklist_items_select ON task_checklist_items;
+CREATE POLICY task_checklist_items_select ON task_checklist_items
+  FOR SELECT USING (
+    is_task_member(task_id)
+    OR EXISTS (
+      SELECT 1 FROM tasks t
+      JOIN projects p ON p.id = t.project_id
+      WHERE t.id = task_id AND can_perform_on_project(p.id, p.workspace_id, p.visibility, 'tasks.view')
+    )
+  );
+
+DROP POLICY IF EXISTS task_checklist_items_write ON task_checklist_items;
+CREATE POLICY task_checklist_items_write ON task_checklist_items
+  FOR ALL USING (
+    has_task_edit_permission(task_id)
+    OR EXISTS (
+      SELECT 1 FROM tasks t
+      JOIN projects p ON p.id = t.project_id
+      WHERE t.id = task_id
+        AND (is_workspace_admin(t.workspace_id) OR can_perform_on_project(p.id, p.workspace_id, p.visibility, 'tasks.edit'))
+    )
+  );
+
+-- ---------------------------------------------------------------------------
 -- custom_roles — superadmin-only to create/edit/delete (mirrors
 -- task_templates); readable by any authenticated user so invite pickers and
 -- the permission-matrix UI can list them.
