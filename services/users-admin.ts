@@ -163,6 +163,100 @@ export async function setUserSuperAdminRole(params: { targetUserId: string; isSu
   await db.update(users).set({ isSuperAdmin: params.isSuperAdmin, updatedAt: new Date() }).where(eq(users.id, params.targetUserId));
 }
 
+/**
+ * Edits an EXISTING user's own details (name/contact/email/business info) —
+ * distinct from setUserSuperAdminRole (the account-level Role toggle) and
+ * resetUserPasswordBySuperAdmin (credentials) so each concern has its own
+ * clear audit trail and its own narrow authorization check, rather than one
+ * do-everything update.
+ */
+export async function updateUserBySuperAdmin(params: {
+  targetUserId: string;
+  actingUserId: string;
+  fullName?: string;
+  contactNumber?: string;
+  email?: string;
+  businessName?: string | null;
+  businessAddress?: string | null;
+}) {
+  if (!(await isSuperAdmin(params.actingUserId))) {
+    throw new NotAuthorizedError("Only a super admin can edit users.");
+  }
+
+  const existing = await db.query.users.findFirst({ where: eq(users.id, params.targetUserId) });
+  if (!existing) throw new ValidationError("User not found.");
+
+  let normalizedEmail: string | undefined;
+  if (params.email !== undefined) {
+    normalizedEmail = params.email.trim().toLowerCase();
+    if (!normalizedEmail) throw new ValidationError("Email address is required.");
+    if (normalizedEmail !== existing.email) {
+      const clash = await db.query.users.findFirst({ where: eq(users.email, normalizedEmail) });
+      if (clash) throw new EmailAlreadyRegisteredError();
+    }
+  }
+
+  if (params.fullName !== undefined && !params.fullName.trim()) {
+    throw new ValidationError("Full name is required.");
+  }
+  if (params.contactNumber !== undefined && !params.contactNumber.trim()) {
+    throw new ValidationError("Contact number is required.");
+  }
+
+  const [updated] = await db
+    .update(users)
+    .set({
+      ...(params.fullName !== undefined ? { fullName: params.fullName.trim() } : {}),
+      ...(params.contactNumber !== undefined ? { contactNumber: params.contactNumber.trim() } : {}),
+      ...(normalizedEmail !== undefined ? { email: normalizedEmail } : {}),
+      ...(params.businessName !== undefined ? { businessName: params.businessName?.trim() || null } : {}),
+      ...(params.businessAddress !== undefined ? { businessAddress: params.businessAddress?.trim() || null } : {}),
+      updatedAt: new Date(),
+    })
+    .where(eq(users.id, params.targetUserId))
+    .returning({
+      id: users.id,
+      email: users.email,
+      fullName: users.fullName,
+      contactNumber: users.contactNumber,
+      businessName: users.businessName,
+      businessAddress: users.businessAddress,
+      isSuperAdmin: users.isSuperAdmin,
+      mustResetPassword: users.mustResetPassword,
+      createdAt: users.createdAt,
+    });
+
+  return updated;
+}
+
+/**
+ * Sets a new temporary password on an existing account, same shape as
+ * account creation's — typed in by the superadmin, shown back once, and
+ * flagged mustResetPassword so it's visibly a superadmin-assigned
+ * credential rather than one the user chose themselves.
+ */
+export async function resetUserPasswordBySuperAdmin(params: {
+  targetUserId: string;
+  actingUserId: string;
+  temporaryPassword: string;
+}) {
+  if (!(await isSuperAdmin(params.actingUserId))) {
+    throw new NotAuthorizedError("Only a super admin can reset a user's password.");
+  }
+  if (!params.temporaryPassword || params.temporaryPassword.length < MIN_PASSWORD_LENGTH) {
+    throw new ValidationError(`Temporary password must be at least ${MIN_PASSWORD_LENGTH} characters.`);
+  }
+
+  const existing = await db.query.users.findFirst({ where: eq(users.id, params.targetUserId) });
+  if (!existing) throw new ValidationError("User not found.");
+
+  const passwordHash = await hash(params.temporaryPassword, 12);
+  await db
+    .update(users)
+    .set({ passwordHash, mustResetPassword: true, updatedAt: new Date() })
+    .where(eq(users.id, params.targetUserId));
+}
+
 async function generateUniqueSlug(tx: any, fullName: string): Promise<string> {
   const base = fullName.trim().toLowerCase().replace(/[^a-z0-9]+/g, "-").slice(0, 40);
   let candidate = `${base}-${Math.random().toString(36).slice(2, 8)}`;

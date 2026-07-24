@@ -58,8 +58,10 @@ export default function UsersShell() {
   const router = useRouter();
   const queryClient = useQueryClient();
   const [createOpen, setCreateOpen] = useState(false);
-  const [createdInfo, setCreatedInfo] = useState<{ email: string; password: string } | null>(null);
+  const [editing, setEditing] = useState<AdminUser | null>(null);
+  const [credentialsInfo, setCredentialsInfo] = useState<{ email: string; password: string } | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [editError, setEditError] = useState<string | null>(null);
 
   const [fullName, setFullName] = useState("");
   const [contactNumber, setContactNumber] = useState("");
@@ -68,6 +70,16 @@ export default function UsersShell() {
   const [temporaryPassword, setTemporaryPassword] = useState("");
   const [businessName, setBusinessName] = useState("");
   const [businessAddress, setBusinessAddress] = useState("");
+
+  // Edit-dialog fields, kept separate from the create form's above so the
+  // two dialogs never bleed state into each other.
+  const [editFullName, setEditFullName] = useState("");
+  const [editContactNumber, setEditContactNumber] = useState("");
+  const [editEmail, setEditEmail] = useState("");
+  const [editRole, setEditRole] = useState<"USER" | "SUPER_ADMIN">("USER");
+  const [editBusinessName, setEditBusinessName] = useState("");
+  const [editBusinessAddress, setEditBusinessAddress] = useState("");
+  const [resetPasswordValue, setResetPasswordValue] = useState("");
 
   const { data: users = [], isLoading } = useQuery({
     queryKey: ["admin-users"],
@@ -108,10 +120,75 @@ export default function UsersShell() {
     onSuccess: (result) => {
       queryClient.invalidateQueries({ queryKey: ["admin-users"] });
       setCreateOpen(false);
-      setCreatedInfo({ email: result.email, password: temporaryPassword });
+      setCredentialsInfo({ email: result.email, password: temporaryPassword });
       resetForm();
     },
     onError: (err: Error) => setError(err.message),
+  });
+
+  function openEdit(u: AdminUser) {
+    setEditing(u);
+    setEditFullName(u.fullName);
+    setEditContactNumber(u.contactNumber ?? "");
+    setEditEmail(u.email);
+    setEditRole(u.isSuperAdmin ? "SUPER_ADMIN" : "USER");
+    setEditBusinessName(u.businessName ?? "");
+    setEditBusinessAddress(u.businessAddress ?? "");
+    setResetPasswordValue("");
+    setEditError(null);
+  }
+
+  const saveEdit = useMutation({
+    mutationFn: async () => {
+      if (!editing) throw new Error("No user selected.");
+      const detailsRes = await fetch(`/api/admin/users/${editing.id}`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        credentials: "include",
+        body: JSON.stringify({
+          fullName: editFullName.trim(),
+          contactNumber: editContactNumber.trim(),
+          email: editEmail.trim(),
+          businessName: editBusinessName.trim() || null,
+          businessAddress: editBusinessAddress.trim() || null,
+        }),
+      });
+      if (!detailsRes.ok) throw new Error((await detailsRes.json().catch(() => ({}))).error ?? "Failed to save details");
+
+      if ((editRole === "SUPER_ADMIN") !== editing.isSuperAdmin) {
+        const roleRes = await fetch(`/api/admin/users/${editing.id}/role`, {
+          method: "PATCH",
+          headers: { "Content-Type": "application/json" },
+          credentials: "include",
+          body: JSON.stringify({ isSuperAdmin: editRole === "SUPER_ADMIN" }),
+        });
+        if (!roleRes.ok) throw new Error((await roleRes.json().catch(() => ({}))).error ?? "Failed to change role");
+      }
+    },
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ["admin-users"] });
+      setEditing(null);
+    },
+    onError: (err: Error) => setEditError(err.message),
+  });
+
+  const resetPassword = useMutation({
+    mutationFn: async () => {
+      if (!editing) throw new Error("No user selected.");
+      const res = await fetch(`/api/admin/users/${editing.id}/reset-password`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        credentials: "include",
+        body: JSON.stringify({ temporaryPassword: resetPasswordValue }),
+      });
+      if (!res.ok) throw new Error((await res.json().catch(() => ({}))).error ?? "Failed to reset password");
+    },
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ["admin-users"] });
+      if (editing) setCredentialsInfo({ email: editing.email, password: resetPasswordValue });
+      setEditing(null);
+    },
+    onError: (err: Error) => setEditError(err.message),
   });
 
   return (
@@ -134,7 +211,8 @@ export default function UsersShell() {
             <p className="mt-1 text-sm text-muted-foreground">
               Add an account directly with a temporary password you set yourself. New users start
               with their own workspace and no access to anyone else's clients or engagements until
-              you or another admin invites them.
+              you or another admin invites them. Click any row to edit their details, role, or reset
+              their password.
             </p>
           </div>
           <Button
@@ -170,7 +248,11 @@ export default function UsersShell() {
                 </thead>
                 <tbody>
                   {users.map((u) => (
-                    <tr key={u.id} className="border-b last:border-b-0 hover:bg-accent/30">
+                    <tr
+                      key={u.id}
+                      onClick={() => openEdit(u)}
+                      className="cursor-pointer border-b last:border-b-0 hover:bg-accent/30"
+                    >
                       <td className="px-4 py-2.5 font-medium">{u.fullName}</td>
                       <td className="px-4 py-2.5 text-muted-foreground">{u.email}</td>
                       <td className="px-4 py-2.5 text-muted-foreground">{u.contactNumber ?? "—"}</td>
@@ -270,30 +352,30 @@ export default function UsersShell() {
         </DialogContent>
       </Dialog>
 
-      <Dialog open={!!createdInfo} onOpenChange={(open) => !open && setCreatedInfo(null)}>
+      <Dialog open={!!credentialsInfo} onOpenChange={(open) => !open && setCredentialsInfo(null)}>
         <DialogContent className="max-w-md">
           <DialogHeader>
             <DialogTitle>User created</DialogTitle>
             <DialogDescription>
-              Share these credentials with {createdInfo?.email} yourself — this password won't be shown again.
+              Share these credentials with {credentialsInfo?.email} yourself — this password won't be shown again.
             </DialogDescription>
           </DialogHeader>
-          {createdInfo && (
+          {credentialsInfo && (
             <div className="space-y-2 rounded-md border bg-muted/30 p-3 text-sm">
               <div className="flex items-center justify-between gap-2">
                 <span className="text-muted-foreground">Email</span>
-                <span className="font-mono">{createdInfo.email}</span>
+                <span className="font-mono">{credentialsInfo.email}</span>
               </div>
               <div className="flex items-center justify-between gap-2">
                 <span className="text-muted-foreground">Temporary password</span>
                 <span className="flex items-center gap-1.5 font-mono">
-                  {createdInfo.password}
+                  {credentialsInfo.password}
                   <Button
                     type="button"
                     variant="ghost"
                     size="icon"
                     className="h-6 w-6"
-                    onClick={() => navigator.clipboard.writeText(createdInfo.password)}
+                    onClick={() => navigator.clipboard.writeText(credentialsInfo.password)}
                   >
                     <Copy className="h-3.5 w-3.5" />
                   </Button>
@@ -301,7 +383,95 @@ export default function UsersShell() {
               </div>
             </div>
           )}
-          <Button onClick={() => setCreatedInfo(null)}>Done</Button>
+          <Button onClick={() => setCredentialsInfo(null)}>Done</Button>
+        </DialogContent>
+      </Dialog>
+
+      <Dialog open={!!editing} onOpenChange={(open) => !open && setEditing(null)}>
+        <DialogContent className="max-h-[85vh] max-w-lg overflow-y-auto">
+          <DialogHeader>
+            <DialogTitle>Edit {editing?.fullName}</DialogTitle>
+            <DialogDescription>Update their details and role, or reset their password below.</DialogDescription>
+          </DialogHeader>
+
+          <form
+            className="space-y-3"
+            onSubmit={(e) => {
+              e.preventDefault();
+              setEditError(null);
+              saveEdit.mutate();
+            }}
+          >
+            <Input placeholder="Full name" value={editFullName} onChange={(e) => setEditFullName(e.target.value)} required />
+            <Input
+              placeholder="Contact number"
+              value={editContactNumber}
+              onChange={(e) => setEditContactNumber(e.target.value)}
+              required
+            />
+            <Input
+              type="email"
+              placeholder="Email address"
+              value={editEmail}
+              onChange={(e) => setEditEmail(e.target.value)}
+              required
+            />
+            <Select value={editRole} onValueChange={(v) => setEditRole(v as "USER" | "SUPER_ADMIN")}>
+              <SelectTrigger>
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectItem value="USER">User</SelectItem>
+                <SelectItem value="SUPER_ADMIN">Super admin</SelectItem>
+              </SelectContent>
+            </Select>
+            <Input
+              placeholder="Business name (optional)"
+              value={editBusinessName}
+              onChange={(e) => setEditBusinessName(e.target.value)}
+            />
+            <Input
+              placeholder="Business address (optional)"
+              value={editBusinessAddress}
+              onChange={(e) => setEditBusinessAddress(e.target.value)}
+            />
+
+            {editError && <p className="text-sm text-destructive">{editError}</p>}
+
+            <Button type="submit" className="w-full" disabled={saveEdit.isPending}>
+              {saveEdit.isPending ? "Saving…" : "Save changes"}
+            </Button>
+          </form>
+
+          <div className="mt-2 space-y-2 border-t pt-4">
+            <p className="text-sm font-medium">Reset password</p>
+            <p className="text-xs text-muted-foreground">
+              Sets a new temporary password you relay to them yourself — shown back once after you submit.
+            </p>
+            <div className="flex gap-2">
+              <Input
+                placeholder="New temporary password (min 8 characters)"
+                value={resetPasswordValue}
+                onChange={(e) => setResetPasswordValue(e.target.value)}
+                minLength={8}
+              />
+              <Button type="button" variant="outline" onClick={() => setResetPasswordValue(randomPassword())}>
+                Generate
+              </Button>
+            </div>
+            <Button
+              type="button"
+              variant="outline"
+              className="w-full"
+              disabled={resetPasswordValue.length < 8 || resetPassword.isPending}
+              onClick={() => {
+                setEditError(null);
+                resetPassword.mutate();
+              }}
+            >
+              {resetPassword.isPending ? "Resetting…" : "Set new password"}
+            </Button>
+          </div>
         </DialogContent>
       </Dialog>
     </div>

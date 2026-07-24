@@ -185,7 +185,10 @@ export async function listProjectsForWorkspace(workspaceId: string, requestingUs
 }
 
 export async function getProject(projectId: string, requestingUserId: string) {
-  const project = await db.query.projects.findFirst({ where: eq(projects.id, projectId) });
+  const project = await db.query.projects.findFirst({
+    where: eq(projects.id, projectId),
+    with: { client: { columns: { id: true, name: true } } },
+  });
   if (!project) throw new NotFoundError("Project not found.");
 
   if (!(await canAccessProject(project, requestingUserId))) {

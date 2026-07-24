@@ -1,11 +1,9 @@
 "use client";
 
 import { useState, type ComponentType } from "react";
-import Link from "next/link";
 import { useSession } from "next-auth/react";
 import { useQuery } from "@tanstack/react-query";
 import {
-  ArrowLeft,
   ChevronsLeft,
   ChevronsRight,
   LayoutGrid,
@@ -18,6 +16,7 @@ import {
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
+import AppSidebar from "@/components/AppSidebar";
 import KanbanBoard from "@/components/KanbanBoard";
 import TaskListView from "@/components/TaskListView";
 import GanttChart from "@/components/GanttChart";
@@ -31,6 +30,7 @@ interface ProjectDetail {
   id: string;
   name: string;
   description: string | null;
+  client: { id: string; name: string } | null;
 }
 
 async function fetchProject(projectId: string): Promise<ProjectDetail> {
@@ -60,7 +60,17 @@ const VIEWS: { key: ViewKey; label: string; icon: ComponentType<{ className?: st
   { key: "ai-review", label: "AI Review", icon: Sparkles },
 ];
 
-export default function ProjectShell({ projectId }: { projectId: string }) {
+export default function ProjectShell({
+  projectId,
+  activeWorkspaceId,
+  userName,
+  isSuperAdmin,
+}: {
+  projectId: string;
+  activeWorkspaceId: string;
+  userName: string;
+  isSuperAdmin?: boolean;
+}) {
   const { data: session } = useSession();
   const [selectedTaskId, setSelectedTaskId] = useState<string | null>(null);
   const [collaboratorModalOpen, setCollaboratorModalOpen] = useState(false);
@@ -82,15 +92,17 @@ export default function ProjectShell({ projectId }: { projectId: string }) {
     members.find((m) => m.userId === session?.user?.id)?.role ?? "VIEWER";
 
   return (
-    <div className="flex min-h-screen flex-col">
+    <div className="flex min-h-screen">
+      <AppSidebar activeWorkspaceId={activeWorkspaceId} userName={userName} isSuperAdmin={isSuperAdmin} />
+      <div className="flex min-h-screen flex-1 flex-col">
       <header className="flex items-center justify-between border-b-2 border-b-gold px-6 py-3">
         <div className="flex items-center gap-3">
-          <Link href="/">
-            <Button variant="ghost" size="icon" className="h-8 w-8">
-              <ArrowLeft className="h-4 w-4" />
-            </Button>
-          </Link>
-          <h1 className="font-semibold">{project?.name ?? "Project"}</h1>
+          <div>
+            {project?.client && (
+              <p className="text-xs font-medium text-muted-foreground">{project.client.name}</p>
+            )}
+            <h1 className="font-semibold">{project?.name ?? "Project"}</h1>
+          </div>
         </div>
         <div className="flex items-center gap-2">
           <Button variant="outline" size="sm" onClick={() => setApplyTemplateOpen(true)}>
@@ -173,6 +185,7 @@ export default function ProjectShell({ projectId }: { projectId: string }) {
       />
 
       <ApplyTemplateDialog projectId={projectId} open={applyTemplateOpen} onOpenChange={setApplyTemplateOpen} />
+      </div>
     </div>
   );
 }

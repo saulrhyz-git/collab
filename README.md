@@ -229,6 +229,32 @@ Three small task-management fixes:
 - **Backlog now sorts first in List view**, not last — just a reorder of the `GROUPS` array in `components/TaskListView.tsx`.
 - **Task checklists** — a lightweight punch-list inside a task (checkbox + short title + optional free-text remarks), separate from the existing "Subtasks" section (which links real child tasks with their own status/assignee). New `task_checklist_items` table (`db/schema.ts`); RLS mirrors `task_comments`' visibility (task-level access via a `task_members` grant or project `tasks.view`) but gates every write — add, toggle-complete, edit, delete — by a single `tasks.edit` check, the same bar as editing the task's own title or description, since there's no meaningful create/toggle/delete split here. `services/task-checklist.ts` (list/add/update/delete) and `app/api/projects/[projectId]/tasks/[taskId]/checklist/**` wire it up; `components/TaskDetailPanel.tsx` renders it as its own "Checklist" section with a completed-count badge, inline add form, and per-item checkbox/delete.
 
+## App navigation sidebar, user management, and self-service profiles
+
+A persistent left-hand navigation shell replacing the old per-page header (WorkspaceSelector + Admin dropdown + username + Sign out button, all previously duplicated across dashboard-shell.tsx alone), plus superadmin editing of existing accounts and a self-service profile page.
+
+### AppSidebar
+
+`components/AppSidebar.tsx` — a dark blue gradient vertical sidebar, mounted in `app/dashboard-shell.tsx`, `app/clients/[clientId]/client-shell.tsx`, `app/projects/[projectId]/project-shell.tsx` (nesting alongside that page's own light collapsible Board/List/Gantt/References/AI-Review view-switcher — two sidebars, different jobs), and the two new list pages below. Contains the `WorkspaceSelector`, three top-level nav links (Dashboard, Clients, Engagements, active-route highlighted), a superadmin-only "Admin" flyout (the same seven links that used to live in dashboard-shell's header dropdown), and a footer with a link to `/profile` and the Sign out button — both moved out of every individual page header into this one shared place.
+
+Every top-level page.tsx that needs to render it calls the new `auth/page-context.ts`'s `resolvePageContext()` — a small extraction of the auth-session + workspace-context-cookie resolution that used to be inlined only in `app/page.tsx`, now shared by every page that mounts the sidebar (`{userId, userName, userEmail, isSuperAdmin, activeWorkspaceId}`, redirecting to `/login` itself if unauthenticated).
+
+### Clients and Engagements summary pages
+
+`/clients` (`app/clients/clients-list-shell.tsx`) and `/engagements` (`app/engagements/engagements-list-shell.tsx`) — sortable, searchable tables of everything in the active workspace, reusing `services/dashboard.ts`'s existing aggregate endpoint (`GET /api/workspaces/:id/dashboard`) rather than standing up new backend queries, since it already computes exactly the per-client/per-engagement task-count rollups these tables need. The Clients page cross-references the full client roster (`GET /api/workspaces/:id/clients`) against that aggregate so a client with zero engagements still shows up (with zeroed stats) rather than being silently dropped, since the dashboard's own `clients` grouping is built FROM visible projects and would otherwise omit it. Clicking an engagement row goes to its Board/List/Gantt page (`/projects/:id`); clicking a client row goes to the existing client detail page (`/clients/:id`), which already lists that client's engagements.
+
+### Engagement page header
+
+`project-shell.tsx`'s header now shows the client's name above the engagement's name (when the engagement has one) instead of just the engagement name alone — `services/projects.ts`'s `getProject` now includes the `client` relation (`id`, `name`) in its response for this.
+
+### Superadmin editing of existing users
+
+`/admin/users` — previously create-only; every row is now clickable and opens an edit dialog covering name/contact/email/business fields, the account-level Role toggle, and a "Reset password" action (sets a new superadmin-typed temporary password, shown back once, same shape as account creation's). `services/users-admin.ts` gained `updateUserBySuperAdmin` and `resetUserPasswordBySuperAdmin`, each with its own narrow authorization check and audit trail rather than folding into one do-everything update — `PATCH /api/admin/users/:userId` and `POST /api/admin/users/:userId/reset-password`.
+
+### Self-service profile
+
+`/profile` (reachable from the sidebar's user-name link) — anyone can edit their own name/email/contact/business fields and change their own password (current-password verified via bcrypt before a new one is set, which also clears `mustResetPassword`). `services/profile.ts` is deliberately separate from `services/users-admin.ts`: every function in it acts only on the caller's own row (no `targetUserId` parameter anywhere), so there's no authorization check beyond being signed in. Routes: `GET`/`PATCH /api/me`, `PATCH /api/me/password`.
+
 ## File map
 
 - `db/schema.ts` — Drizzle schema: workspaces, clients, projects, tasks (+ subtasks + dependencies + comments), memberships, invitations, activity log.
@@ -238,6 +264,7 @@ Three small task-management fixes:
 - `auth/auth.config.ts`, `auth/index.ts` — NextAuth v5 credentials provider, JWT callbacks.
 - `auth/workspace-context.middleware.ts` — resolves and **verifies** the active workspace on every request; also where the super-admin bypass short-circuits the membership lookup.
 - `auth/super-admin.ts` — `isSuperAdmin(userId)` check used by the middleware, services, and the realtime server.
+- `auth/page-context.ts` — `resolvePageContext()`, the shared server-component helper (session + super-admin flag + active workspace) every top-level page.tsx that renders `AppSidebar` calls.
 - `services/clients.ts` — `createClient`, `listClientsForWorkspace`, `getClient`, `updateClient`, `archiveClient`.
 - `services/projects.ts` — `createProject`, `listProjectsForWorkspace` (super admin sees all), `getProject`, `updateProject`, `archiveProject`.
 - `services/tasks.ts` — CRUD plus `getTaskDetail` (task + assignee + reporter + subtasks + dependency edges in one call).
@@ -256,17 +283,21 @@ Three small task-management fixes:
 - `services/custom-roles.ts` — CRUD for named PROJECT/CLIENT-scoped roles (superadmin-only writes), plus `syncCustomRoleGrants` (full-replace a role's `role_permissions` grants against the catalog, used by both create and edit) and `getCustomRoleWithGrants` (role + its currently-granted keys, for pre-checking the edit dialog's tickboxes); deleting a role also clears its `role_permissions` rows.
 - `services/client-members.ts`, `services/project-custom-role-members.ts`, `services/task-members.ts` — direct (non-invite) grant/revoke for client-wide, engagement-level-custom-role, and single-task access respectively.
 - `services/client-invitations.ts`, `services/task-invitations.ts` — by-email invite flows mirroring `services/invitations.ts`'s token/expiry/acceptance shape, for client-wide and single-task access.
-- `services/users-admin.ts` — `createUserBySuperAdmin`, `listAllUsers`, `setUserSuperAdminRole` — the superadmin "add user" facility.
+- `services/users-admin.ts` — `createUserBySuperAdmin`, `listAllUsers`, `setUserSuperAdminRole`, `updateUserBySuperAdmin`, `resetUserPasswordBySuperAdmin` — the superadmin user-management facility (create, list, edit, role, password reset — each a separate function with its own auth check).
+- `services/profile.ts` — `getOwnProfile`, `updateOwnProfile`, `changeOwnPassword` — self-service, every function scoped to the caller's own row only.
 - `scripts/seed-superadmin.ts` — creates/promotes the super admin account from `.env`.
 - `app/api/**/route.ts` — Next.js route handlers wiring the above into HTTP, including `app/api/admin/**` (permissions, permission-catalog, task templates, engagement types, SMTP/AI settings, custom roles, users — all superadmin-gated), `app/api/projects/[projectId]/files/**` (uploads, download, delete, promote, AI review), `app/api/projects/[projectId]/custom-role-members/**` and `.../tasks/[taskId]/members|invitations/**`, and `app/api/clients/[clientId]/members|invitations/**`.
-- `app/dashboard-shell.tsx` — the post-login landing page: stats, my tasks, upcoming deadlines, recent activity, clients/engagements roster, and a superadmin-only "Admin" menu (permissions matrix, custom roles, users, task templates, engagement types, SMTP settings, AI provider settings).
+- `app/dashboard-shell.tsx` — the post-login landing page: stats, my tasks, upcoming deadlines, recent activity, and the clients/engagements roster (`AppSidebar` handles navigation and sign-out now, not this file).
+- `app/clients/clients-list-shell.tsx`, `app/engagements/engagements-list-shell.tsx` — the sortable/searchable Clients and Engagements summary pages (`/clients`, `/engagements`).
+- `app/profile/profile-shell.tsx` — self-service "manage your own account" page (`/profile`).
 - `app/admin/**` — superadmin-only pages: permissions matrix, custom roles, users, task template builder, engagement type builder, SMTP settings, AI provider settings.
-- `app/projects/[projectId]/` — project detail page and the collapsible-sidebar view shell (Board/List/Gantt/References/AI Review).
+- `app/projects/[projectId]/` — project detail page and the collapsible-sidebar view shell (Board/List/Gantt/References/AI Review), nested inside `AppSidebar`.
 - `app/clients/[clientId]/` — client detail page (contact info, notes, engagements, collaborators).
 - `lib/format-activity.ts` — turns an activity-log row into a human sentence for the recent-activity feed.
 - `lib/crypto-secrets.ts` — AES-256-GCM encrypt/decrypt for secrets at rest (`ENCRYPTION_KEY`).
 - `lib/file-storage.ts` — local-disk file storage helpers (`UPLOADS_DIR`).
 - `lib/document-text-extraction.ts` — PDF/Word/text extraction for the AI review flow.
+- `components/AppSidebar.tsx` — the persistent dark-blue-gradient app navigation shell (WorkspaceSelector, Dashboard/Clients/Engagements links, superadmin Admin flyout, profile link, Sign out).
 - `components/*.tsx` — WorkspaceSelector, ProjectCollaboratorModal, ClientCollaboratorsModal, TaskCollaboratorsModal, KanbanBoard, TaskListView, GanttChart, TaskDetailPanel, CreateProjectDialog, CreateClientDialog, ApplyTemplateDialog, ReferencesTab, AiReviewTab, plus the shadcn/ui primitives under `components/ui/`.
 - `realtime/socket-server.ts` — Socket.io server with room-based project isolation.
 

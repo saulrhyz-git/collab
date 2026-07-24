@@ -39,6 +39,8 @@ export function mapDomainError(err: unknown): NextResponse | null {
       return NextResponse.json({ error: (err as Error).message || "Unauthenticated" }, { status: 401 });
     case "NotAuthorizedError":
       return NextResponse.json({ error: (err as Error).message || "Forbidden" }, { status: 403 });
+    case "IncorrectPasswordError":
+      return NextResponse.json({ error: (err as Error).message || "Incorrect password" }, { status: 401 });
     case "InvalidInviteError":
     case "NotFoundError":
       return NextResponse.json({ error: (err as Error).message || "Not found" }, { status: 404 });

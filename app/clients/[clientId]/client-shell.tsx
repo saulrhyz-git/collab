@@ -2,11 +2,11 @@
 
 import { useState } from "react";
 import Link from "next/link";
-import { useRouter } from "next/navigation";
 import { useQuery } from "@tanstack/react-query";
-import { ArrowLeft, Building2, Mail, User as UserIcon, Plus, Lock, Globe, Users } from "lucide-react";
+import { Building2, Mail, User as UserIcon, Plus, Lock, Globe, Users } from "lucide-react";
 import CreateProjectDialog from "@/components/CreateProjectDialog";
 import ClientCollaboratorsModal from "@/components/ClientCollaboratorsModal";
+import AppSidebar from "@/components/AppSidebar";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent } from "@/components/ui/card";
 
@@ -34,8 +34,17 @@ async function fetchClient(clientId: string): Promise<ClientDetail> {
   return res.json();
 }
 
-export default function ClientShell({ clientId }: { clientId: string }) {
-  const router = useRouter();
+export default function ClientShell({
+  clientId,
+  activeWorkspaceId,
+  userName,
+  isSuperAdmin,
+}: {
+  clientId: string;
+  activeWorkspaceId: string;
+  userName: string;
+  isSuperAdmin?: boolean;
+}) {
   const [createOpen, setCreateOpen] = useState(false);
   const [collaboratorsOpen, setCollaboratorsOpen] = useState(false);
 
@@ -45,14 +54,8 @@ export default function ClientShell({ clientId }: { clientId: string }) {
   });
 
   return (
-    <div className="flex min-h-screen flex-col">
-      <header className="border-b px-6 py-3">
-        <Button variant="ghost" size="sm" onClick={() => router.push("/")}>
-          <ArrowLeft className="mr-1.5 h-4 w-4" />
-          Back to dashboard
-        </Button>
-      </header>
-
+    <div className="flex min-h-screen">
+      <AppSidebar activeWorkspaceId={activeWorkspaceId} userName={userName} isSuperAdmin={isSuperAdmin} />
       <main className="mx-auto w-full max-w-4xl flex-1 space-y-6 px-6 py-8">
         {isLoading ? (
           <p className="text-sm text-muted-foreground">Loading…</p>

@@ -1,11 +1,16 @@
-import { redirect } from "next/navigation";
-import { auth } from "../../../auth";
+import { resolvePageContext } from "../../../auth/page-context";
 import ClientShell from "./client-shell";
 
 export default async function ClientPage({ params }: { params: Promise<{ clientId: string }> }) {
-  const session = await auth();
-  if (!session?.user?.id) redirect("/login");
-
+  const ctx = await resolvePageContext();
   const { clientId } = await params;
-  return <ClientShell clientId={clientId} />;
+
+  return (
+    <ClientShell
+      clientId={clientId}
+      activeWorkspaceId={ctx.activeWorkspaceId}
+      userName={ctx.userName}
+      isSuperAdmin={ctx.isSuperAdmin}
+    />
+  );
 }
