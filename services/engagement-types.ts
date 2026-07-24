@@ -69,7 +69,15 @@ export async function createEngagementType(params: {
       );
     }
 
-    return getEngagementType(type.id);
+    // Re-fetch through the same transaction handle (tx), not a module-level
+    // helper that resolves `db` independently — see services/projects.ts's
+    // createProject for why this matters (RETURNING-vs-RLS bootstrap class
+    // of bug from earlier this session).
+    const withTemplates = await tx.query.engagementTypes.findFirst({
+      where: eq(engagementTypes.id, type.id),
+      with: { templates: { with: { template: true } } },
+    });
+    return withTemplates!;
   });
 }
 

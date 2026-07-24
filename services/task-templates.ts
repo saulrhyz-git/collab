@@ -68,7 +68,15 @@ export async function createTaskTemplate(params: {
       }))
     );
 
-    return getTaskTemplate(template.id);
+    // Re-fetch through the same transaction handle (tx), not a module-level
+    // helper that resolves `db` independently — see services/projects.ts's
+    // createProject for why this matters (RETURNING-vs-RLS bootstrap class
+    // of bug from earlier this session).
+    const withItems = await tx.query.taskTemplates.findFirst({
+      where: eq(taskTemplates.id, template.id),
+      with: { items: { orderBy: (i, { asc }) => [asc(i.position)] } },
+    });
+    return withItems!;
   });
 }
 
